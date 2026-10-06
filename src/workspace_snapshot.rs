@@ -115,6 +115,7 @@ pub fn encode_directory(root: &Path) -> Result<Vec<u8>, WorkspaceSnapshotError> 
         &mut entry_count,
         &mut snapshot_bytes,
     )?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
     encode(&files)
 }
 
@@ -134,7 +135,7 @@ fn collect_directory_files(
         }
         entries.push(entry);
     }
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(|entry| entry.file_name().to_string_lossy().into_owned());
 
     for entry in entries {
         let path = entry.path();
