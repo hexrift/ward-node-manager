@@ -72,6 +72,7 @@ pub enum RunError {
     EngineFailed,
     OutputReadFailed,
     WorkspaceTransferFailed,
+    CleanupFailed,
     Cancelled,
 }
 
@@ -83,6 +84,7 @@ impl std::fmt::Display for RunError {
             Self::EngineFailed => "container_run_failed",
             Self::OutputReadFailed => "container_output_unavailable",
             Self::WorkspaceTransferFailed => "workspace_transfer_failed",
+            Self::CleanupFailed => "container_cleanup_failed",
             Self::Cancelled => "task_cancelled",
         };
         formatter.write_str(message)
@@ -344,7 +346,10 @@ impl NodeManager {
                 Some(mut stdin) => Some(thread::spawn(move || stdin.write_all(&archive))),
                 None => {
                     let _ = child.kill();
-                    self.remove_container(&name);
+                    let _ = child.wait();
+                    if self.remove_container(&name).is_err() {
+                        return Err(RunError::CleanupFailed);
+                    }
                     return Err(RunError::WorkspaceTransferFailed);
                 }
             },
@@ -355,10 +360,11 @@ impl NodeManager {
         let status = loop {
             if self.cancelled.load(Ordering::Acquire) {
                 let _ = child.kill();
-                self.remove_container(&name);
                 if let Some(writer) = workspace_writer.take() {
                     let _ = writer.join();
                 }
+                let _ = child.wait();
+                self.remove_container(&name)?;
                 return Err(RunError::Cancelled);
             }
             match child.try_wait() {
@@ -367,25 +373,27 @@ impl NodeManager {
                 Ok(None) => {
                     timed_out = true;
                     let _ = child.kill();
-                    self.remove_container(&name);
                     if let Some(writer) = workspace_writer.take() {
                         let _ = writer.join();
                     }
-                    break child.wait().map_err(|_| RunError::EngineFailed)?;
+                    let status = child.wait();
+                    self.remove_container(&name)?;
+                    break status.map_err(|_| RunError::EngineFailed)?;
                 }
                 Err(_) => {
                     let _ = child.kill();
-                    self.remove_container(&name);
                     if let Some(writer) = workspace_writer.take() {
                         let _ = writer.join();
                     }
+                    let _ = child.wait();
+                    self.remove_container(&name)?;
                     return Err(RunError::EngineFailed);
                 }
             }
         };
         timed_out = container_timed_out(timed_out, status.code());
         if workspace_writer.is_some_and(|writer| !matches!(writer.join(), Ok(Ok(())))) {
-            self.remove_container(&name);
+            self.remove_container(&name)?;
             return Err(RunError::WorkspaceTransferFailed);
         }
         let (stdout, stdout_truncated) = stdout_reader
@@ -407,8 +415,8 @@ impl NodeManager {
         })
     }
 
-    fn remove_container(&self, name: &str) {
-        let _ = Command::new(&self.docker_binary)
+    fn remove_container(&self, name: &str) -> Result<(), RunError> {
+        let status = Command::new(&self.docker_binary)
             .arg("--context")
             .arg("default")
             .args(["rm", "--force", "--", name])
@@ -416,7 +424,13 @@ impl NodeManager {
             .envs(docker_environment(std::env::vars_os()))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
+            .map_err(|_| RunError::CleanupFailed)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(RunError::CleanupFailed)
+        }
     }
 }
 
