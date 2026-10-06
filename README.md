@@ -60,6 +60,9 @@ can pack a directory into WNM1, rejecting symlinks and special files while
 bounding traversal to 512 entries. It can also convert snapshots to
 deterministic USTAR archives containing regular files only.
 
+`wardnm snapshot pack DIRECTORY OUTPUT` creates a WNM1 snapshot and refuses to
+overwrite an existing output file.
+
 `wardnm run --snapshot FILE -- COMMAND ...` reads at most 16 MiB of WNM1 data,
 validates and converts it before starting Docker, then streams the archive over
 Docker stdin into a private 32 MiB `/workspace` tmpfs. The task runs with
