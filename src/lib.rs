@@ -642,7 +642,6 @@ mod tests {
     use super::docker_environment;
     #[cfg(unix)]
     use super::{Limits, ManagerConfig, NodeManager, RunError, TaskSpec, PINNED_IMAGE};
-    #[cfg(unix)]
     use crate::workspace_snapshot;
     use std::ffi::OsString;
     #[cfg(unix)]
