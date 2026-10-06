@@ -5,6 +5,8 @@ const MAX_FILES: usize = 128;
 const MAX_PATH_BYTES: usize = 255;
 const MAX_FILE_BYTES: usize = 1_048_576;
 const MAX_SNAPSHOT_BYTES: usize = 16_777_216;
+const TAR_BLOCK_BYTES: usize = 512;
+const MAX_TAR_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_FILES * 1024 + TAR_BLOCK_BYTES * 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceFile {
@@ -87,6 +89,53 @@ pub fn decode(encoded: &[u8]) -> Result<Vec<WorkspaceFile>, WorkspaceSnapshotErr
     Ok(files)
 }
 
+pub fn encode_tar(files: &[WorkspaceFile]) -> Result<Vec<u8>, WorkspaceSnapshotError> {
+    validate_files(files)?;
+
+    let mut snapshot_bytes = 6_usize;
+    let mut archive = Vec::new();
+
+    for file in files {
+        let path_bytes = file.path.len();
+        snapshot_bytes = snapshot_bytes
+            .checked_add(6 + path_bytes + file.contents.len())
+            .ok_or(WorkspaceSnapshotError::SnapshotTooLarge)?;
+        if snapshot_bytes > MAX_SNAPSHOT_BYTES {
+            return Err(WorkspaceSnapshotError::SnapshotTooLarge);
+        }
+
+        let (name, prefix) = split_ustar_path(&file.path)?;
+        let mut header = [0_u8; TAR_BLOCK_BYTES];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        write_octal(&mut header, 100, 8, 0o644)?;
+        write_octal(&mut header, 108, 8, 0)?;
+        write_octal(&mut header, 116, 8, 0)?;
+        write_octal(&mut header, 124, 12, file.contents.len() as u64)?;
+        write_octal(&mut header, 136, 12, 0)?;
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        header[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
+
+        let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
+        let checksum = format!("{checksum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum.as_bytes());
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(&file.contents);
+
+        let padding = (TAR_BLOCK_BYTES - file.contents.len() % TAR_BLOCK_BYTES) % TAR_BLOCK_BYTES;
+        archive.resize(archive.len() + padding, 0);
+    }
+
+    archive.resize(archive.len() + TAR_BLOCK_BYTES * 2, 0);
+    if archive.len() > MAX_TAR_BYTES {
+        return Err(WorkspaceSnapshotError::SnapshotTooLarge);
+    }
+
+    Ok(archive)
+}
+
 fn validate_files(files: &[WorkspaceFile]) -> Result<(), WorkspaceSnapshotError> {
     if files.len() > MAX_FILES {
         return Err(WorkspaceSnapshotError::TooManyFiles);
@@ -144,6 +193,36 @@ fn valid_path(path: &str) -> bool {
             .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
+fn split_ustar_path(path: &str) -> Result<(&str, &str), WorkspaceSnapshotError> {
+    if path.len() <= 100 {
+        return Ok((path, ""));
+    }
+
+    path.match_indices('/')
+        .rev()
+        .find_map(|(index, _)| {
+            let prefix = &path[..index];
+            let name = &path[index + 1..];
+            (prefix.len() <= 155 && name.len() <= 100).then_some((name, prefix))
+        })
+        .ok_or(WorkspaceSnapshotError::InvalidPath)
+}
+
+fn write_octal(
+    header: &mut [u8; TAR_BLOCK_BYTES],
+    offset: usize,
+    width: usize,
+    value: u64,
+) -> Result<(), WorkspaceSnapshotError> {
+    let digits = format!("{value:0width$o}", width = width - 1);
+    if digits.len() >= width {
+        return Err(WorkspaceSnapshotError::SnapshotTooLarge);
+    }
+    header[offset..offset + digits.len()].copy_from_slice(digits.as_bytes());
+    header[offset + width - 1] = 0;
+    Ok(())
+}
+
 fn read_u16(encoded: &[u8], cursor: &mut usize) -> Result<u16, WorkspaceSnapshotError> {
     let bytes = read_bytes(encoded, cursor, 2)?;
     Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
@@ -173,7 +252,7 @@ fn read_bytes<'a>(
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{decode, encode, WorkspaceFile, WorkspaceSnapshotError};
+    use super::{decode, encode, encode_tar, WorkspaceFile, WorkspaceSnapshotError};
 
     fn file(path: &str, contents: &[u8]) -> WorkspaceFile {
         WorkspaceFile {
@@ -321,6 +400,54 @@ mod tests {
                 .map(|entry| entry.path)
                 .collect::<BTreeSet<_>>(),
             paths
+        );
+    }
+
+    #[test]
+    fn encodes_a_deterministic_regular_file_tar_archive() {
+        let files = [file("src/main.rs", b"rust")];
+        let archive = encode_tar(&files).expect("encode tar");
+
+        assert_eq!(archive.len(), 2048);
+        assert_eq!(&archive[..11], b"src/main.rs");
+        assert_eq!(archive[156], b'0');
+        assert_eq!(&archive[257..263], b"ustar\0");
+        assert_eq!(&archive[512..516], b"rust");
+        assert!(archive[516..1024].iter().all(|byte| *byte == 0));
+        assert!(archive[1024..].iter().all(|byte| *byte == 0));
+
+        let expected_checksum = u64::from_str_radix(
+            std::str::from_utf8(&archive[148..154]).expect("checksum digits"),
+            8,
+        )
+        .expect("octal checksum");
+        let actual_checksum = archive[..512]
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| {
+                if (148..156).contains(&index) {
+                    b' ' as u64
+                } else {
+                    u64::from(*byte)
+                }
+            })
+            .sum::<u64>();
+        assert_eq!(expected_checksum, actual_checksum);
+        assert_eq!(archive, encode_tar(&files).expect("repeat encode"));
+    }
+
+    #[test]
+    fn encodes_long_paths_with_ustar_prefix_and_rejects_unrepresentable_paths() {
+        let name = "a".repeat(100);
+        let path = format!("src/{name}");
+        let archive = encode_tar(&[file(&path, b"")]).expect("long path");
+        assert_eq!(&archive[..100], name.as_bytes());
+        assert_eq!(&archive[345..348], b"src");
+
+        let unrepresentable = format!("{}/{}", "a".repeat(101), "b".repeat(101));
+        assert_eq!(
+            encode_tar(&[file(&unrepresentable, b"")]),
+            Err(WorkspaceSnapshotError::InvalidPath)
         );
     }
 }
