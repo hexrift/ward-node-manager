@@ -248,9 +248,7 @@ pub fn encode_tar(files: &[WorkspaceFile]) -> Result<Vec<u8>, WorkspaceSnapshotE
 }
 
 pub fn decode_tar(archive: &[u8]) -> Result<Vec<WorkspaceFile>, WorkspaceSnapshotError> {
-    if archive.len() > MAX_TAR_BYTES
-        || !archive.chunks_exact(TAR_BLOCK_BYTES).remainder().is_empty()
-    {
+    if archive.len() > MAX_TAR_BYTES || !archive.as_chunks::<TAR_BLOCK_BYTES>().1.is_empty() {
         return Err(WorkspaceSnapshotError::InvalidFormat);
     }
 
