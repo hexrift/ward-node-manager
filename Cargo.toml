@@ -1,0 +1,13 @@
+[package]
+name = "ward-node-manager"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ward_node_manager"
+
+[[bin]]
+name = "wardnm"
+path = "src/main.rs"
+
+[dependencies]
