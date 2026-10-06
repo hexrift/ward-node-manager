@@ -15,6 +15,7 @@ const MAX_ARGUMENTS: usize = 64;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 const MAX_ARGUMENT_LENGTH: usize = 4096;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const RESULT_FRAME_MAGIC: &[u8] = b"WNMOUT1\n";
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -72,6 +73,7 @@ pub enum RunError {
     EngineFailed,
     OutputReadFailed,
     WorkspaceTransferFailed,
+    WorkspaceOutputInvalid,
     CleanupFailed,
     Cancelled,
 }
@@ -84,6 +86,7 @@ impl std::fmt::Display for RunError {
             Self::EngineFailed => "container_run_failed",
             Self::OutputReadFailed => "container_output_unavailable",
             Self::WorkspaceTransferFailed => "workspace_transfer_failed",
+            Self::WorkspaceOutputInvalid => "workspace_output_invalid",
             Self::CleanupFailed => "container_cleanup_failed",
             Self::Cancelled => "task_cancelled",
         };
@@ -101,6 +104,88 @@ pub struct RunResult {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub output_truncated: bool,
+    pub workspace_snapshot: Option<Vec<u8>>,
+}
+
+struct WorkspaceResultFrame {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    output_truncated: bool,
+    archive: Vec<u8>,
+}
+
+fn decode_workspace_result_frame(
+    frame: &[u8],
+    output_limit: usize,
+) -> Result<WorkspaceResultFrame, RunError> {
+    let mut cursor = 0;
+    if frame.get(..RESULT_FRAME_MAGIC.len()) != Some(RESULT_FRAME_MAGIC) {
+        return Err(RunError::WorkspaceOutputInvalid);
+    }
+    cursor += RESULT_FRAME_MAGIC.len();
+    let stdout_length = read_frame_length(frame, &mut cursor, output_limit)?;
+    let stderr_length = read_frame_length(frame, &mut cursor, output_limit)?;
+    let stdout_truncated = read_frame_flag(frame, &mut cursor)?;
+    let stderr_truncated = read_frame_flag(frame, &mut cursor)?;
+    let stdout = read_frame_bytes(frame, &mut cursor, stdout_length)?.to_vec();
+    let stderr = read_frame_bytes(frame, &mut cursor, stderr_length)?.to_vec();
+    let archive = frame
+        .get(cursor..)
+        .ok_or(RunError::WorkspaceOutputInvalid)?
+        .to_vec();
+    if workspace_snapshot::decode_tar(&archive).is_err() {
+        return Err(RunError::WorkspaceOutputInvalid);
+    }
+    Ok(WorkspaceResultFrame {
+        stdout,
+        stderr,
+        output_truncated: stdout_truncated || stderr_truncated,
+        archive,
+    })
+}
+
+fn read_frame_length(frame: &[u8], cursor: &mut usize, maximum: usize) -> Result<usize, RunError> {
+    let remaining = frame
+        .get(*cursor..)
+        .ok_or(RunError::WorkspaceOutputInvalid)?;
+    let line_length = remaining
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or(RunError::WorkspaceOutputInvalid)?;
+    let line = &remaining[..line_length];
+    if line.is_empty() || line.iter().any(|byte| !byte.is_ascii_digit()) {
+        return Err(RunError::WorkspaceOutputInvalid);
+    }
+    let length = std::str::from_utf8(line)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value <= maximum)
+        .ok_or(RunError::WorkspaceOutputInvalid)?;
+    *cursor += line_length + 1;
+    Ok(length)
+}
+
+fn read_frame_flag(frame: &[u8], cursor: &mut usize) -> Result<bool, RunError> {
+    match read_frame_bytes(frame, cursor, 2)? {
+        [b'0', b'\n'] => Ok(false),
+        [b'1', b'\n'] => Ok(true),
+        _ => Err(RunError::WorkspaceOutputInvalid),
+    }
+}
+
+fn read_frame_bytes<'a>(
+    frame: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], RunError> {
+    let end = cursor
+        .checked_add(length)
+        .ok_or(RunError::WorkspaceOutputInvalid)?;
+    let bytes = frame
+        .get(*cursor..end)
+        .ok_or(RunError::WorkspaceOutputInvalid)?;
+    *cursor = end;
+    Ok(bytes)
 }
 
 pub fn validate(task: &TaskSpec, config: &ManagerConfig) -> Result<(), ValidationError> {
@@ -138,12 +223,13 @@ pub fn build_docker_args(
     task: &TaskSpec,
     config: &ManagerConfig,
 ) -> Result<Vec<String>, ValidationError> {
-    build_docker_command(task, config).map(|(args, _)| args)
+    build_docker_command(task, config, false).map(|(args, _)| args)
 }
 
 fn build_docker_command(
     task: &TaskSpec,
     config: &ManagerConfig,
+    capture_workspace_snapshot: bool,
 ) -> Result<(Vec<String>, Option<Vec<u8>>), ValidationError> {
     validate(task, config)?;
     let workspace_archive = task
@@ -213,10 +299,13 @@ fn build_docker_command(
         args.extend([
             "sh".into(),
             "-c".into(),
-            "tar -xf - -C /workspace && wall_seconds=\"$1\" && shift && exec /bin/busybox timeout -s KILL \"$wall_seconds\" \"$@\"".into(),
+            workspace_task_command(capture_workspace_snapshot).into(),
             "wardnm".into(),
             limits.wall_seconds.to_string(),
         ]);
+        if capture_workspace_snapshot {
+            args.push(limits.output_bytes.to_string());
+        }
     } else {
         args.extend([
             "timeout".into(),
@@ -231,6 +320,33 @@ fn build_docker_command(
 
 pub fn container_name(run_id: &str, task_id: &str) -> String {
     format!("pnm-{run_id}-{task_id}")
+}
+
+fn workspace_task_command(capture_workspace_snapshot: bool) -> &'static str {
+    if !capture_workspace_snapshot {
+        return "tar -xf - -C /workspace && wall_seconds=\"$1\" && shift && exec /bin/busybox timeout -s KILL \"$wall_seconds\" \"$@\"";
+    }
+
+    r#"tar -xf - -C /workspace || exit 125
+wall_seconds="$1"
+output_limit="$2"
+shift 2
+mkdir -p /tmp/wardnm-meta || exit 125
+/bin/busybox timeout -s KILL "$wall_seconds" "$@" > /tmp/wardnm-meta/stdout 2> /tmp/wardnm-meta/stderr
+task_status=$?
+stdout_bytes=$(wc -c < /tmp/wardnm-meta/stdout)
+stderr_bytes=$(wc -c < /tmp/wardnm-meta/stderr)
+stdout_truncated=0
+stderr_truncated=0
+[ "$stdout_bytes" -le "$output_limit" ] || stdout_truncated=1
+[ "$stderr_bytes" -le "$output_limit" ] || stderr_truncated=1
+printf 'WNMOUT1\n%s\n%s\n%s\n%s\n' "$((stdout_bytes < output_limit ? stdout_bytes : output_limit))" "$((stderr_bytes < output_limit ? stderr_bytes : output_limit))" "$stdout_truncated" "$stderr_truncated"
+head -c "$output_limit" /tmp/wardnm-meta/stdout
+head -c "$output_limit" /tmp/wardnm-meta/stderr
+unsupported=$(find /workspace ! -type d ! -type f -print -quit) || exit 125
+[ -z "$unsupported" ] || exit 125
+(cd /workspace && find . -type f | tar -cf - -T -) || exit 125
+exit "$task_status""#
 }
 
 fn safe_identifier(value: &str, max_length: usize) -> bool {
@@ -317,13 +433,51 @@ pub struct NodeManager {
 
 impl NodeManager {
     pub fn run(&self, task: &TaskSpec) -> Result<RunResult, RunError> {
-        let (args, workspace_archive) =
-            build_docker_command(task, &self.config).map_err(RunError::Invalid)?;
+        self.run_task(task, false)
+    }
+
+    pub fn run_with_workspace_snapshot(&self, task: &TaskSpec) -> Result<RunResult, RunError> {
+        if task.workspace_snapshot.is_none() {
+            return Err(RunError::Invalid(ValidationError::WorkspaceSnapshot));
+        }
+        self.run_task(task, true)
+    }
+
+    fn run_task(
+        &self,
+        task: &TaskSpec,
+        capture_workspace_snapshot: bool,
+    ) -> Result<RunResult, RunError> {
+        let (mut args, workspace_archive) =
+            build_docker_command(task, &self.config, capture_workspace_snapshot)
+                .map_err(RunError::Invalid)?;
         let name = container_name(&self.config.run_id, &task.id);
-        let mut child = Command::new(&self.docker_binary)
-            .arg("--context")
-            .arg("default")
-            .args(args)
+        if capture_workspace_snapshot {
+            args[0] = "create".into();
+            args.retain(|argument| argument != "--rm");
+            let created = Command::new(&self.docker_binary)
+                .arg("--context")
+                .arg("default")
+                .args(args.iter())
+                .env_clear()
+                .envs(docker_environment(std::env::vars_os()))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|_| RunError::EngineUnavailable)?;
+            if !created.success() {
+                return Err(RunError::EngineFailed);
+            }
+        }
+        let mut command = Command::new(&self.docker_binary);
+        command.arg("--context").arg("default");
+        if capture_workspace_snapshot {
+            command.args(["start", "--attach", "--interactive", &name]);
+        } else {
+            command.args(args);
+        }
+        let mut child = match command
             .env_clear()
             .envs(docker_environment(std::env::vars_os()))
             .stdin(if workspace_archive.is_some() {
@@ -334,12 +488,25 @@ impl NodeManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|_| RunError::EngineUnavailable)?;
+        {
+            Ok(child) => child,
+            Err(_) => {
+                if capture_workspace_snapshot {
+                    self.remove_container(&name)?;
+                }
+                return Err(RunError::EngineUnavailable);
+            }
+        };
 
         let stdout = child.stdout.take().ok_or(RunError::OutputReadFailed)?;
         let stderr = child.stderr.take().ok_or(RunError::OutputReadFailed)?;
         let output_limit = self.config.limits.output_bytes;
-        let stdout_reader = thread::spawn(move || capture_limited(stdout, output_limit));
+        let stdout_limit = if capture_workspace_snapshot {
+            workspace_snapshot::MAX_TAR_BYTES + output_limit * 2 + 128
+        } else {
+            output_limit
+        };
+        let stdout_reader = thread::spawn(move || capture_limited(stdout, stdout_limit));
         let stderr_reader = thread::spawn(move || capture_limited(stderr, output_limit));
         let mut workspace_writer = match workspace_archive {
             Some(archive) => match child.stdin.take() {
@@ -377,7 +544,9 @@ impl NodeManager {
                         let _ = writer.join();
                     }
                     let status = child.wait();
-                    self.remove_container(&name)?;
+                    if !capture_workspace_snapshot {
+                        self.remove_container(&name)?;
+                    }
                     break status.map_err(|_| RunError::EngineFailed)?;
                 }
                 Err(_) => {
@@ -404,6 +573,36 @@ impl NodeManager {
             .join()
             .map_err(|_| RunError::OutputReadFailed)?
             .map_err(|_| RunError::OutputReadFailed)?;
+        let result = if capture_workspace_snapshot {
+            if stdout_truncated {
+                Err(RunError::WorkspaceOutputInvalid)
+            } else {
+                decode_workspace_result_frame(&stdout, output_limit).and_then(|frame| {
+                    let workspace_snapshot = if status.success() && !timed_out {
+                        let files = workspace_snapshot::decode_tar(&frame.archive)
+                            .map_err(|_| RunError::WorkspaceOutputInvalid)?;
+                        Some(
+                            workspace_snapshot::encode(&files)
+                                .map_err(|_| RunError::WorkspaceOutputInvalid)?,
+                        )
+                    } else {
+                        None
+                    };
+                    Ok((
+                        frame.stdout,
+                        frame.stderr,
+                        frame.output_truncated || stderr_truncated,
+                        workspace_snapshot,
+                    ))
+                })
+            }
+        } else {
+            Ok((stdout, stderr, stdout_truncated || stderr_truncated, None))
+        };
+        if capture_workspace_snapshot {
+            self.remove_container(&name)?;
+        }
+        let (stdout, stderr, output_truncated, workspace_snapshot) = result?;
 
         Ok(RunResult {
             task_id: task.id.clone(),
@@ -411,7 +610,8 @@ impl NodeManager {
             timed_out,
             stdout,
             stderr,
-            output_truncated: stdout_truncated || stderr_truncated,
+            output_truncated,
+            workspace_snapshot,
         })
     }
 
@@ -438,10 +638,10 @@ impl NodeManager {
 mod tests {
     use super::capture_limited;
     use super::container_timed_out;
+    use super::decode_workspace_result_frame;
     use super::docker_environment;
     #[cfg(unix)]
     use super::{Limits, ManagerConfig, NodeManager, RunError, TaskSpec, PINNED_IMAGE};
-    #[cfg(unix)]
     use crate::workspace_snapshot;
     use std::ffi::OsString;
     #[cfg(unix)]
@@ -467,6 +667,43 @@ mod tests {
         let (output, truncated) = capture_limited(Cursor::new(b"abcde"), 5).unwrap();
         assert_eq!(output, b"abcde");
         assert!(!truncated);
+    }
+
+    #[test]
+    fn decodes_a_bounded_workspace_result_frame() {
+        let snapshot = workspace_snapshot::encode_tar(&[workspace_snapshot::WorkspaceFile {
+            path: "result.txt".into(),
+            contents: b"done".to_vec(),
+        }])
+        .expect("encode archive");
+        assert!(workspace_snapshot::decode_tar(&snapshot).is_ok());
+        let mut frame = b"WNMOUT1\n3\n2\n0\n1\n".to_vec();
+        frame.extend_from_slice(b"outer");
+        frame.extend_from_slice(&snapshot);
+
+        let result = decode_workspace_result_frame(&frame, 8).expect("decode frame");
+        assert_eq!(result.stdout, b"out");
+        assert_eq!(result.stderr, b"er");
+        assert!(result.output_truncated);
+        assert_eq!(
+            workspace_snapshot::decode_tar(&result.archive).expect("decode snapshot"),
+            [workspace_snapshot::WorkspaceFile {
+                path: "result.txt".into(),
+                contents: b"done".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_workspace_result_frames() {
+        for frame in [
+            b"invalid".as_slice(),
+            b"WNMOUT1\n999\n0\n0\n0\n".as_slice(),
+            b"WNMOUT1\n1\n0\n2\n0\nx".as_slice(),
+            b"WNMOUT1\n1\n0\n0\n0\nx".as_slice(),
+        ] {
+            assert!(decode_workspace_result_frame(frame, 8).is_err());
+        }
     }
 
     #[test]
@@ -554,6 +791,83 @@ mod tests {
             expected_archive
         );
 
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn returns_a_validated_workspace_snapshot_and_removes_the_container() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "wardnm-result-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).expect("create test directory");
+        let docker = directory.join("docker");
+        fs::write(
+            &docker,
+            "#!/bin/sh\ncase \"$3\" in\ncreate) printf 'container-id\\n' ;;\nstart) cat > \"$0.input\"; printf 'WNMOUT1\\n11\\n0\\n0\\n0\\ntask-output'; cat \"$0.archive\" ;;\nrm) printf '%s\\n' \"$@\" > \"$0.cleanup\" ;;\nesac\n",
+        )
+        .expect("write fake engine");
+        let mut permissions = fs::metadata(&docker)
+            .expect("engine metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&docker, permissions).expect("make fake engine executable");
+        let archive = workspace_snapshot::encode_tar(&[workspace_snapshot::WorkspaceFile {
+            path: "result.txt".into(),
+            contents: b"updated".to_vec(),
+        }])
+        .expect("encode result archive");
+        fs::write(directory.join("docker.archive"), archive).expect("write result archive");
+        let files = [workspace_snapshot::WorkspaceFile {
+            path: "input.txt".into(),
+            contents: b"input".to_vec(),
+        }];
+        let snapshot = workspace_snapshot::encode(&files).expect("encode snapshot");
+        let manager = NodeManager {
+            config: ManagerConfig {
+                image: PINNED_IMAGE.into(),
+                run_id: "run-result".into(),
+                limits: Limits {
+                    wall_seconds: 10,
+                    memory_bytes: 128 * 1024 * 1024,
+                    cpu_millis: 500,
+                    pids: 32,
+                    output_bytes: 4096,
+                },
+            },
+            docker_binary: docker.to_string_lossy().into_owned(),
+            cancelled: Default::default(),
+        };
+
+        let result = manager
+            .run_with_workspace_snapshot(&TaskSpec {
+                id: "task-result".into(),
+                argv: vec!["cat".into(), "input.txt".into()],
+                workspace_snapshot: Some(snapshot),
+            })
+            .expect("run fake engine");
+
+        assert_eq!(result.stdout, b"task-output");
+        assert_eq!(
+            workspace_snapshot::decode(
+                result
+                    .workspace_snapshot
+                    .as_deref()
+                    .expect("workspace snapshot")
+            )
+            .expect("decode returned snapshot"),
+            [workspace_snapshot::WorkspaceFile {
+                path: "result.txt".into(),
+                contents: b"updated".to_vec(),
+            }]
+        );
+        assert!(fs::read_to_string(directory.join("docker.cleanup"))
+            .expect("cleanup invocation")
+            .contains("--force"));
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 

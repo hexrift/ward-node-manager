@@ -33,6 +33,18 @@ fn packs_a_directory_into_a_wnm1_snapshot() {
         .expect("run wardnm");
 
     assert!(result.status.success());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&output)
+                .expect("snapshot metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
     assert_eq!(
         decode(&fs::read(output).expect("read packed snapshot")).expect("decode snapshot"),
         [WorkspaceFile {
@@ -76,6 +88,24 @@ fn rejects_an_unavailable_source_without_creating_a_snapshot() {
         .args(["snapshot", "pack"])
         .arg(directory.join("missing"))
         .arg(&output)
+        .output()
+        .expect("run wardnm");
+
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("workspace_snapshot_invalid"));
+    assert!(!output.exists());
+    fs::remove_dir_all(directory).expect("remove test directory");
+}
+
+#[test]
+fn rejects_snapshot_output_without_an_input_snapshot() {
+    let directory = test_directory();
+    let output = directory.join("workspace-output.wnm");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_wardnm"))
+        .args(["run", "--task-id", "workspace", "--snapshot-output"])
+        .arg(&output)
+        .args(["--", "true"])
         .output()
         .expect("run wardnm");
 

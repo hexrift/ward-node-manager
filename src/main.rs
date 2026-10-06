@@ -31,6 +31,7 @@ fn run() -> Result<i32, String> {
     let mut run_id = format!("run-{}-{}", std::process::id(), timestamp_nanos());
     let mut task_id = None;
     let mut workspace_snapshot = None;
+    let mut workspace_snapshot_output = None;
     let mut limits = Limits {
         wall_seconds: 30,
         memory_bytes: 256 * 1024 * 1024,
@@ -49,6 +50,7 @@ fn run() -> Result<i32, String> {
             "--run-id" => run_id = value,
             "--task-id" => task_id = Some(value),
             "--snapshot" => workspace_snapshot = Some(read_snapshot(&value)?),
+            "--snapshot-output" => workspace_snapshot_output = Some(value),
             "--wall-seconds" => limits.wall_seconds = parse(&value)?,
             "--memory-bytes" => limits.memory_bytes = parse(&value)?,
             "--cpu-millis" => limits.cpu_millis = parse(&value)?,
@@ -75,12 +77,30 @@ fn run() -> Result<i32, String> {
         docker_binary: "docker".into(),
         cancelled: Default::default(),
     };
-    match manager.run(&task) {
+    if workspace_snapshot_output.is_some() && task.workspace_snapshot.is_none() {
+        return Err("workspace_snapshot_invalid".into());
+    }
+    let result = if workspace_snapshot_output.is_some() {
+        manager.run_with_workspace_snapshot(&task)
+    } else {
+        manager.run(&task)
+    };
+    match result {
         Ok(result) => {
             let stdout = json_string(&String::from_utf8_lossy(&result.stdout));
             let stderr = json_string(&String::from_utf8_lossy(&result.stderr));
+            let workspace_snapshot_bytes = match (
+                workspace_snapshot_output.as_deref(),
+                result.workspace_snapshot.as_deref(),
+            ) {
+                (Some(path), Some(snapshot)) => {
+                    write_snapshot_output(path, snapshot)?;
+                    snapshot.len().to_string()
+                }
+                _ => "null".into(),
+            };
             println!(
-                "{{\"status\":\"{}\",\"taskId\":{},\"exitCode\":{},\"timedOut\":{},\"outputTruncated\":{},\"stdout\":{},\"stderr\":{}}}",
+                "{{\"status\":\"{}\",\"taskId\":{},\"exitCode\":{},\"timedOut\":{},\"outputTruncated\":{},\"stdout\":{},\"stderr\":{},\"workspaceSnapshotBytes\":{}}}",
                 if result.exit_code == Some(0) && !result.timed_out { "completed" } else { "failed" },
                 json_string(&result.task_id),
                 result.exit_code.map_or("null".into(), |value| value.to_string()),
@@ -88,6 +108,7 @@ fn run() -> Result<i32, String> {
                 result.output_truncated,
                 stdout,
                 stderr,
+                workspace_snapshot_bytes,
             );
             Ok(if result.exit_code == Some(0) && !result.timed_out {
                 0
@@ -97,6 +118,16 @@ fn run() -> Result<i32, String> {
         }
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn write_snapshot_output(path: &str, snapshot: &[u8]) -> Result<(), String> {
+    let mut file = create_private_snapshot(path).map_err(|_| "snapshot_output_unavailable")?;
+    if file.write_all(snapshot).is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err("snapshot_output_unavailable".into());
+    }
+    Ok(())
 }
 
 fn pack_snapshot(mut args: impl Iterator<Item = String>) -> Result<i32, String> {
@@ -111,11 +142,7 @@ fn pack_snapshot(mut args: impl Iterator<Item = String>) -> Result<i32, String> 
 
     let snapshot =
         encode_directory(Path::new(&source)).map_err(|_| "workspace_snapshot_invalid")?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&output)
-        .map_err(|_| "snapshot_output_unavailable")?;
+    let mut file = create_private_snapshot(&output).map_err(|_| "snapshot_output_unavailable")?;
     if file.write_all(&snapshot).is_err() {
         drop(file);
         let _ = fs::remove_file(output);
@@ -124,6 +151,17 @@ fn pack_snapshot(mut args: impl Iterator<Item = String>) -> Result<i32, String> 
 
     println!("{{\"status\":\"packed\",\"bytes\":{}}}", snapshot.len());
     Ok(0)
+}
+
+fn create_private_snapshot(path: impl AsRef<Path>) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 fn read_snapshot(path: &str) -> Result<Vec<u8>, String> {
