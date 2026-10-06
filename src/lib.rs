@@ -425,7 +425,9 @@ mod tests {
     use super::capture_limited;
     use super::container_timed_out;
     use super::docker_environment;
+    #[cfg(unix)]
     use super::{Limits, ManagerConfig, NodeManager, TaskSpec, PINNED_IMAGE};
+    #[cfg(unix)]
     use crate::workspace_snapshot;
     use std::ffi::OsString;
     #[cfg(unix)]
