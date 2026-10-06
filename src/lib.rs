@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod workspace_snapshot;
+
 use std::ffi::OsString;
 use std::io::{ErrorKind, Read};
 use std::process::{Command, Stdio};
