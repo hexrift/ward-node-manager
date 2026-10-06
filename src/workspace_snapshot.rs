@@ -173,7 +173,7 @@ fn read_bytes<'a>(
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{decode, encode, WorkspaceFile, WorkspaceSnapshotError};
+    use super::{decode, encode, encode_tar, WorkspaceFile, WorkspaceSnapshotError};
 
     fn file(path: &str, contents: &[u8]) -> WorkspaceFile {
         WorkspaceFile {
@@ -321,6 +321,54 @@ mod tests {
                 .map(|entry| entry.path)
                 .collect::<BTreeSet<_>>(),
             paths
+        );
+    }
+
+    #[test]
+    fn encodes_a_deterministic_regular_file_tar_archive() {
+        let files = [file("src/main.rs", b"rust")];
+        let archive = encode_tar(&files).expect("encode tar");
+
+        assert_eq!(archive.len(), 2048);
+        assert_eq!(&archive[..11], b"src/main.rs");
+        assert_eq!(archive[156], b'0');
+        assert_eq!(&archive[257..263], b"ustar\0");
+        assert_eq!(&archive[512..516], b"rust");
+        assert!(archive[516..1024].iter().all(|byte| *byte == 0));
+        assert!(archive[1024..].iter().all(|byte| *byte == 0));
+
+        let expected_checksum = u64::from_str_radix(
+            std::str::from_utf8(&archive[148..154]).expect("checksum digits"),
+            8,
+        )
+        .expect("octal checksum");
+        let actual_checksum = archive[..512]
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| {
+                if (148..156).contains(&index) {
+                    b' ' as u64
+                } else {
+                    u64::from(*byte)
+                }
+            })
+            .sum::<u64>();
+        assert_eq!(expected_checksum, actual_checksum);
+        assert_eq!(archive, encode_tar(&files).expect("repeat encode"));
+    }
+
+    #[test]
+    fn encodes_long_paths_with_ustar_prefix_and_rejects_unrepresentable_paths() {
+        let name = "a".repeat(100);
+        let path = format!("src/{name}");
+        let archive = encode_tar(&[file(&path, b"")]).expect("long path");
+        assert_eq!(&archive[..100], name.as_bytes());
+        assert_eq!(&archive[345..348], b"src");
+
+        let unrepresentable = format!("{}/{}", "a".repeat(101), "b".repeat(101));
+        assert_eq!(
+            encode_tar(&[file(&unrepresentable, b"")]),
+            Err(WorkspaceSnapshotError::InvalidPath)
         );
     }
 }
