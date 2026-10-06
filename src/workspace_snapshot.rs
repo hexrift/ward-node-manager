@@ -364,10 +364,13 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
         decode, encode, encode_directory, encode_tar, WorkspaceFile, WorkspaceSnapshotError,
     };
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
     fn file(path: &str, contents: &[u8]) -> WorkspaceFile {
         WorkspaceFile {
@@ -380,10 +383,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "wardnm-snapshot-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
+            NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).expect("create test directory");
         path

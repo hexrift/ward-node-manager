@@ -449,6 +449,11 @@ mod tests {
     use std::io::Cursor;
     #[cfg(unix)]
     use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(unix)]
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn captures_only_the_configured_output_prefix_and_drains_the_rest() {
@@ -503,10 +508,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!(
             "wardnm-stdin-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
+            NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&directory).expect("create test directory");
         let docker = directory.join("docker");
@@ -562,10 +564,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!(
             "wardnm-cleanup-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
+            NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&directory).expect("create test directory");
         let docker = directory.join("docker");
