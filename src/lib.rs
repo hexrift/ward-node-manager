@@ -426,13 +426,15 @@ mod tests {
     use super::container_timed_out;
     use super::docker_environment;
     #[cfg(unix)]
-    use super::{Limits, ManagerConfig, NodeManager, TaskSpec, PINNED_IMAGE};
+    use super::{Limits, ManagerConfig, NodeManager, RunError, TaskSpec, PINNED_IMAGE};
     #[cfg(unix)]
     use crate::workspace_snapshot;
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::fs;
     use std::io::Cursor;
+    #[cfg(unix)]
+    use std::path::PathBuf;
 
     #[test]
     fn captures_only_the_configured_output_prefix_and_drains_the_rest() {
@@ -536,6 +538,83 @@ mod tests {
             expected_archive
         );
 
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    fn cancelled_manager(cleanup_exit_code: i32) -> (PathBuf, NodeManager) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "wardnm-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).expect("create test directory");
+        let docker = directory.join("docker");
+        fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nif [ \"$3\" = rm ]; then printf '%s\\n' \"$@\" > \"$0.cleanup\"; exit {cleanup_exit_code}; fi\nexec sleep 30\n"
+            ),
+        )
+        .expect("write fake engine");
+        let mut permissions = fs::metadata(&docker)
+            .expect("engine metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&docker, permissions).expect("make fake engine executable");
+
+        let manager = NodeManager {
+            config: ManagerConfig {
+                image: PINNED_IMAGE.into(),
+                run_id: "run-test".into(),
+                limits: Limits {
+                    wall_seconds: 10,
+                    memory_bytes: 128 * 1024 * 1024,
+                    cpu_millis: 500,
+                    pids: 32,
+                    output_bytes: 4096,
+                },
+            },
+            docker_binary: docker.to_string_lossy().into_owned(),
+            cancelled: std::sync::atomic::AtomicBool::new(true),
+        };
+
+        (directory, manager)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_cancelled_after_forced_container_cleanup_succeeds() {
+        let (directory, manager) = cancelled_manager(0);
+        let result = manager.run(&TaskSpec {
+            id: "task-test".into(),
+            argv: vec!["true".into()],
+            workspace_snapshot: None,
+        });
+
+        assert!(matches!(result, Err(RunError::Cancelled)));
+        assert!(fs::read_to_string(directory.join("docker.cleanup"))
+            .expect("cleanup invocation")
+            .contains("--force"));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_cleanup_failure_instead_of_claiming_cancelled() {
+        let (directory, manager) = cancelled_manager(1);
+        let result = manager.run(&TaskSpec {
+            id: "task-test".into(),
+            argv: vec!["true".into()],
+            workspace_snapshot: None,
+        });
+
+        assert!(matches!(result, Err(RunError::CleanupFailed)));
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 }
