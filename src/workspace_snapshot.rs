@@ -251,14 +251,31 @@ fn read_bytes<'a>(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::PathBuf;
 
-    use super::{decode, encode, encode_tar, WorkspaceFile, WorkspaceSnapshotError};
+    use super::{
+        decode, encode, encode_directory, encode_tar, WorkspaceFile, WorkspaceSnapshotError,
+    };
 
     fn file(path: &str, contents: &[u8]) -> WorkspaceFile {
         WorkspaceFile {
             path: path.into(),
             contents: contents.to_vec(),
         }
+    }
+
+    fn temporary_directory() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "wardnm-snapshot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&path).expect("create test directory");
+        path
     }
 
     #[test]
@@ -449,5 +466,39 @@ mod tests {
             encode_tar(&[file(&unrepresentable, b"")]),
             Err(WorkspaceSnapshotError::InvalidPath)
         );
+    }
+
+    #[test]
+    fn encodes_directory_files_in_deterministic_path_order() {
+        let directory = temporary_directory();
+        fs::create_dir(directory.join("src")).expect("create nested directory");
+        fs::write(directory.join("src/z.js"), b"last").expect("write nested file");
+        fs::write(directory.join("a.js"), b"first").expect("write root file");
+
+        let encoded = encode_directory(&directory).expect("encode directory");
+        let files = decode(&encoded).expect("decode directory snapshot");
+
+        assert_eq!(
+            files,
+            [file("a.js", b"first"), file("src/z.js", b"last")]
+        );
+        assert_eq!(encoded, encode_directory(&directory).expect("repeat encode"));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinks_in_workspace_directories() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        fs::write(directory.join("target"), b"data").expect("write target");
+        symlink("target", directory.join("link")).expect("create symlink");
+
+        assert_eq!(
+            encode_directory(&directory),
+            Err(WorkspaceSnapshotError::UnsupportedFileType)
+        );
+        fs::remove_dir_all(directory).expect("remove test directory");
     }
 }
