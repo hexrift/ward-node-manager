@@ -124,7 +124,7 @@ fn transfers_validated_workspace_without_host_mounts() {
     assert!(args.windows(2).any(|pair| {
         pair == [
             "--tmpfs",
-            "/workspace:rw,noexec,nosuid,nodev,size=32m,mode=0700,uid=65534,gid=65534"
+            "/workspace:rw,noexec,nosuid,nodev,size=32m,mode=0700,uid=65534,gid=65534",
         ]
     }));
     assert!(args
@@ -136,7 +136,7 @@ fn transfers_validated_workspace_without_host_mounts() {
         [
             "sh",
             "-c",
-            "tar -xf - -C /workspace && shift && exec /bin/busybox timeout -s KILL \"$@\"",
+            "tar -xf - -C /workspace && wall_seconds=\"$1\" && shift && exec /bin/busybox timeout -s KILL \"$wall_seconds\" \"$@\"",
             "wardnm",
             "10",
             "node",
