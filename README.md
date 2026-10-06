@@ -56,8 +56,9 @@ contents. It accepts at most 128 files, 255 UTF-8 path bytes per file, 1 MiB per
 file, and 16 MiB total. Paths must be relative, slash-separated, normalized,
 unique, and cannot represent both a file and one of its descendants. Symlinks,
 permissions, and other filesystem metadata are not represented. The library
-can convert snapshots to deterministic USTAR archives containing regular
-files only.
+can pack a directory into WNM1, rejecting symlinks and special files while
+bounding traversal to 512 entries. It can also convert snapshots to
+deterministic USTAR archives containing regular files only.
 
 `wardnm run --snapshot FILE -- COMMAND ...` reads at most 16 MiB of WNM1 data,
 validates and converts it before starting Docker, then streams the archive over
