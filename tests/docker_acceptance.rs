@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ward_node_manager::workspace_snapshot::{decode, WorkspaceFile};
 use ward_node_manager::PINNED_IMAGE;
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -23,6 +24,7 @@ fn packs_transfers_runs_and_removes_a_workspace_task() {
     let directory = test_directory();
     let source = directory.join("source");
     let snapshot = directory.join("workspace.wnm");
+    let output_snapshot = directory.join("workspace-output.wnm");
     let marker = "wardnm-docker-acceptance-ok";
     fs::create_dir(&source).expect("create source directory");
     fs::write(source.join("marker.txt"), marker).expect("write marker");
@@ -60,17 +62,45 @@ fn packs_transfers_runs_and_removes_a_workspace_task() {
             "--snapshot",
         ])
         .arg(&snapshot)
-        .args(["--", "cat", "marker.txt"])
+        .args(["--snapshot-output"])
+        .arg(&output_snapshot)
+        .args([
+            "--",
+            "sh",
+            "-c",
+            "printf changed > marker.txt && cat marker.txt",
+        ])
         .output()
         .expect("run workspace task");
     assert!(
         result.status.success(),
-        "task failed: {}",
-        String::from_utf8_lossy(&result.stdout)
+        "task failed: {} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&output_snapshot)
+                .expect("output snapshot metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
     let result = String::from_utf8_lossy(&result.stdout);
     assert!(result.contains("\"status\":\"completed\""));
-    assert!(result.contains(marker));
+    assert!(result.contains("changed"));
+    assert_eq!(
+        decode(&fs::read(output_snapshot).expect("read output snapshot"))
+            .expect("decode output snapshot"),
+        [WorkspaceFile {
+            path: "marker.txt".into(),
+            contents: b"changed".to_vec(),
+        }]
+    );
 
     let run_filter = format!("label=com.portable-node-manager.run={run_id}");
     let task_filter = format!("label=com.portable-node-manager.task={task_id}");

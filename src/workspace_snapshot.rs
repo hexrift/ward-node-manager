@@ -9,7 +9,7 @@ const MAX_PATH_BYTES: usize = 255;
 const MAX_FILE_BYTES: usize = 1_048_576;
 pub const MAX_SNAPSHOT_BYTES: usize = 16_777_216;
 const TAR_BLOCK_BYTES: usize = 512;
-const MAX_TAR_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_FILES * 1024 + TAR_BLOCK_BYTES * 2;
+pub const MAX_TAR_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_FILES * 1024 + TAR_BLOCK_BYTES * 2;
 const MAX_DIRECTORY_ENTRIES: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -247,6 +247,127 @@ pub fn encode_tar(files: &[WorkspaceFile]) -> Result<Vec<u8>, WorkspaceSnapshotE
     Ok(archive)
 }
 
+pub fn decode_tar(archive: &[u8]) -> Result<Vec<WorkspaceFile>, WorkspaceSnapshotError> {
+    if archive.len() > MAX_TAR_BYTES || archive.len() % TAR_BLOCK_BYTES != 0 {
+        return Err(WorkspaceSnapshotError::InvalidFormat);
+    }
+
+    let mut cursor = 0;
+    let mut files = Vec::new();
+    while cursor + TAR_BLOCK_BYTES <= archive.len() {
+        let header = &archive[cursor..cursor + TAR_BLOCK_BYTES];
+        if header.iter().all(|byte| *byte == 0) {
+            if archive.len() - cursor < TAR_BLOCK_BYTES * 2
+                || archive[cursor..].iter().any(|byte| *byte != 0)
+            {
+                return Err(WorkspaceSnapshotError::InvalidFormat);
+            }
+            validate_files(&files)?;
+            return Ok(files);
+        }
+        validate_tar_header(header)?;
+
+        let name = tar_string(&header[..100])?;
+        let prefix = tar_string(&header[345..500])?;
+        let mut path = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if let Some(relative) = path.strip_prefix("./") {
+            path = relative.to_owned();
+        }
+        if files.len() == MAX_FILES {
+            return Err(WorkspaceSnapshotError::TooManyFiles);
+        }
+        let size = tar_octal(&header[124..136])?;
+        if size > MAX_FILE_BYTES as u64 {
+            return Err(WorkspaceSnapshotError::FileTooLarge);
+        }
+        let size = size as usize;
+        let data_start = cursor + TAR_BLOCK_BYTES;
+        let data_end = data_start
+            .checked_add(size)
+            .ok_or(WorkspaceSnapshotError::InvalidFormat)?;
+        let padded_end = data_start
+            .checked_add(size.div_ceil(TAR_BLOCK_BYTES) * TAR_BLOCK_BYTES)
+            .ok_or(WorkspaceSnapshotError::InvalidFormat)?;
+        let contents = archive
+            .get(data_start..data_end)
+            .ok_or(WorkspaceSnapshotError::InvalidFormat)?
+            .to_vec();
+        let padding = archive
+            .get(data_end..padded_end)
+            .ok_or(WorkspaceSnapshotError::InvalidFormat)?;
+        if padding.iter().any(|byte| *byte != 0) {
+            return Err(WorkspaceSnapshotError::InvalidFormat);
+        }
+
+        files.push(WorkspaceFile { path, contents });
+        cursor = padded_end;
+    }
+    Err(WorkspaceSnapshotError::InvalidFormat)
+}
+
+fn validate_tar_header(header: &[u8]) -> Result<(), WorkspaceSnapshotError> {
+    let posix_ustar = &header[257..263] == b"ustar\0" && &header[263..265] == b"00";
+    let busybox_ustar = &header[257..265] == b"ustar  \0";
+    if header[156] != b'0' || !(posix_ustar || busybox_ustar) {
+        return Err(WorkspaceSnapshotError::UnsupportedFileType);
+    }
+
+    let expected = tar_octal(&header[148..156])?;
+    let actual = header
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            if (148..156).contains(&index) {
+                u64::from(b' ')
+            } else {
+                u64::from(*byte)
+            }
+        })
+        .sum::<u64>();
+    if expected != actual {
+        return Err(WorkspaceSnapshotError::InvalidFormat);
+    }
+    Ok(())
+}
+
+fn tar_string(field: &[u8]) -> Result<String, WorkspaceSnapshotError> {
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
+    if field[end..].iter().any(|byte| *byte != 0) {
+        return Err(WorkspaceSnapshotError::InvalidFormat);
+    }
+    std::str::from_utf8(&field[..end])
+        .map(str::to_owned)
+        .map_err(|_| WorkspaceSnapshotError::InvalidPath)
+}
+
+fn tar_octal(field: &[u8]) -> Result<u64, WorkspaceSnapshotError> {
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0 || *byte == b' ')
+        .unwrap_or(field.len());
+    if end == 0
+        || field[end..].iter().any(|byte| *byte != 0 && *byte != b' ')
+        || field[..end]
+            .iter()
+            .any(|byte| !(b'0'..=b'7').contains(byte))
+    {
+        return Err(WorkspaceSnapshotError::InvalidFormat);
+    }
+    field[..end].iter().try_fold(0_u64, |value, digit| {
+        value
+            .checked_mul(8)
+            .and_then(|value| value.checked_add(u64::from(digit - b'0')))
+            .ok_or(WorkspaceSnapshotError::InvalidFormat)
+    })
+}
+
 fn validate_files(files: &[WorkspaceFile]) -> Result<(), WorkspaceSnapshotError> {
     if files.len() > MAX_FILES {
         return Err(WorkspaceSnapshotError::TooManyFiles);
@@ -367,7 +488,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        decode, encode, encode_directory, encode_tar, WorkspaceFile, WorkspaceSnapshotError,
+        decode, decode_tar, encode, encode_directory, encode_tar, WorkspaceFile,
+        WorkspaceSnapshotError, TAR_BLOCK_BYTES,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -399,6 +521,52 @@ mod tests {
         assert_eq!(
             decode(&encode(&files).expect("encode")).expect("decode"),
             files
+        );
+    }
+
+    #[test]
+    fn decodes_the_bounded_tar_archive_used_for_workspace_transfer() {
+        let files = vec![
+            file("src/main.rs", b"fn main() {}"),
+            file("README.md", b"demo"),
+        ];
+        let archive = encode_tar(&files).expect("encode archive");
+
+        assert_eq!(decode_tar(&archive).expect("decode archive"), files);
+    }
+
+    #[test]
+    fn rejects_tar_archives_outside_the_supported_format() {
+        let archive = encode_tar(&[file("result.txt", b"ok")]).expect("encode archive");
+        let mut corrupt = archive.clone();
+        corrupt[0] ^= 1;
+        assert_eq!(
+            decode_tar(&corrupt),
+            Err(WorkspaceSnapshotError::InvalidFormat)
+        );
+
+        let mut oversized = archive;
+        oversized.extend_from_slice(&[0; 1]);
+        assert_eq!(
+            decode_tar(&oversized),
+            Err(WorkspaceSnapshotError::InvalidFormat)
+        );
+    }
+
+    #[test]
+    fn decodes_the_busybox_ustar_header_format() {
+        let mut archive = encode_tar(&[file("result.txt", b"ok")]).expect("encode archive");
+        archive[257..265].copy_from_slice(b"ustar  \0");
+        archive[148..156].fill(b' ');
+        let checksum = archive[..TAR_BLOCK_BYTES]
+            .iter()
+            .map(|byte| u64::from(*byte))
+            .sum::<u64>();
+        archive[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+
+        assert_eq!(
+            decode_tar(&archive).expect("decode archive"),
+            [file("result.txt", b"ok")]
         );
     }
 
