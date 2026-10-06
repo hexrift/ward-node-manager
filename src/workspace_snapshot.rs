@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 const MAGIC: &[u8; 4] = b"WNM1";
 const MAX_FILES: usize = 128;
 const MAX_PATH_BYTES: usize = 255;
@@ -20,6 +22,153 @@ pub enum WorkspaceSnapshotError {
     SnapshotTooLarge,
 }
 
+pub fn encode(files: &[WorkspaceFile]) -> Result<Vec<u8>, WorkspaceSnapshotError> {
+    validate_files(files)?;
+
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(MAGIC);
+    encoded.extend_from_slice(&(files.len() as u16).to_be_bytes());
+
+    for file in files {
+        let path = file.path.as_bytes();
+        encoded.extend_from_slice(&(path.len() as u16).to_be_bytes());
+        encoded.extend_from_slice(&(file.contents.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(path);
+        encoded.extend_from_slice(&file.contents);
+
+        if encoded.len() > MAX_SNAPSHOT_BYTES {
+            return Err(WorkspaceSnapshotError::SnapshotTooLarge);
+        }
+    }
+
+    Ok(encoded)
+}
+
+pub fn decode(encoded: &[u8]) -> Result<Vec<WorkspaceFile>, WorkspaceSnapshotError> {
+    if encoded.len() > MAX_SNAPSHOT_BYTES {
+        return Err(WorkspaceSnapshotError::SnapshotTooLarge);
+    }
+
+    if encoded.get(..MAGIC.len()) != Some(MAGIC) {
+        return Err(WorkspaceSnapshotError::InvalidFormat);
+    }
+
+    let mut cursor = MAGIC.len();
+    let count = read_u16(encoded, &mut cursor)? as usize;
+
+    if count > MAX_FILES {
+        return Err(WorkspaceSnapshotError::TooManyFiles);
+    }
+
+    let mut files = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let path_length = read_u16(encoded, &mut cursor)? as usize;
+        let file_length = read_u32(encoded, &mut cursor)? as usize;
+
+        if file_length > MAX_FILE_BYTES {
+            return Err(WorkspaceSnapshotError::FileTooLarge);
+        }
+
+        let path_bytes = read_bytes(encoded, &mut cursor, path_length)?;
+        let path = std::str::from_utf8(path_bytes)
+            .map_err(|_| WorkspaceSnapshotError::InvalidPath)?
+            .to_owned();
+        let contents = read_bytes(encoded, &mut cursor, file_length)?.to_vec();
+
+        files.push(WorkspaceFile { path, contents });
+    }
+
+    if cursor != encoded.len() {
+        return Err(WorkspaceSnapshotError::InvalidFormat);
+    }
+
+    validate_files(&files)?;
+    Ok(files)
+}
+
+fn validate_files(files: &[WorkspaceFile]) -> Result<(), WorkspaceSnapshotError> {
+    if files.len() > MAX_FILES {
+        return Err(WorkspaceSnapshotError::TooManyFiles);
+    }
+
+    let mut paths = BTreeSet::new();
+
+    for file in files {
+        if !valid_path(&file.path) {
+            return Err(WorkspaceSnapshotError::InvalidPath);
+        }
+        if file.contents.len() > MAX_FILE_BYTES {
+            return Err(WorkspaceSnapshotError::FileTooLarge);
+        }
+        if paths.contains(file.path.as_str()) {
+            return Err(WorkspaceSnapshotError::DuplicatePath);
+        }
+
+        let components = file.path.split('/').collect::<Vec<_>>();
+        let mut prefix = String::new();
+
+        for component in components.iter().take(components.len() - 1) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+
+            if paths.contains(prefix.as_str()) {
+                return Err(WorkspaceSnapshotError::InvalidPath);
+            }
+        }
+
+        paths.insert(file.path.as_str());
+
+        if paths.iter().any(|path| {
+            path.len() > file.path.len()
+                && path.starts_with(&file.path)
+                && path.as_bytes().get(file.path.len()) == Some(&b'/')
+        }) {
+            return Err(WorkspaceSnapshotError::InvalidPath);
+        }
+    }
+
+    Ok(())
+}
+
+fn valid_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= MAX_PATH_BYTES
+        && !path.starts_with('/')
+        && !path.contains(['\\', ':'])
+        && !path.chars().any(char::is_control)
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn read_u16(encoded: &[u8], cursor: &mut usize) -> Result<u16, WorkspaceSnapshotError> {
+    let bytes = read_bytes(encoded, cursor, 2)?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32(encoded: &[u8], cursor: &mut usize) -> Result<u32, WorkspaceSnapshotError> {
+    let bytes = read_bytes(encoded, cursor, 4)?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_bytes<'a>(
+    encoded: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], WorkspaceSnapshotError> {
+    let end = cursor
+        .checked_add(length)
+        .ok_or(WorkspaceSnapshotError::InvalidFormat)?;
+    let bytes = encoded
+        .get(*cursor..end)
+        .ok_or(WorkspaceSnapshotError::InvalidFormat)?;
+    *cursor = end;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -35,15 +184,32 @@ mod tests {
 
     #[test]
     fn encodes_and_decodes_a_bounded_snapshot() {
-        let files = vec![file("src/main.rs", b"fn main() {}"), file("README.md", b"demo")];
+        let files = vec![
+            file("src/main.rs", b"fn main() {}"),
+            file("README.md", b"demo"),
+        ];
 
-        assert_eq!(decode(&encode(&files).expect("encode")).expect("decode"), files);
+        assert_eq!(
+            decode(&encode(&files).expect("encode")).expect("decode"),
+            files
+        );
     }
 
     #[test]
     fn rejects_noncanonical_or_escaping_paths() {
-        for path in ["", "/etc/passwd", "../secret", "src/../secret", "a//b", "a\\b", "C:/secret"] {
-            assert_eq!(encode(&[file(path, b"x")]), Err(WorkspaceSnapshotError::InvalidPath));
+        for path in [
+            "",
+            "/etc/passwd",
+            "../secret",
+            "src/../secret",
+            "a//b",
+            "a\\b",
+            "C:/secret",
+        ] {
+            assert_eq!(
+                encode(&[file(path, b"x")]),
+                Err(WorkspaceSnapshotError::InvalidPath)
+            );
         }
     }
 
@@ -68,19 +234,33 @@ mod tests {
         let total = (0..17)
             .map(|index| file(&format!("f{index}"), &vec![0; 1_000_000]))
             .collect::<Vec<_>>();
-        assert_eq!(encode(&total), Err(WorkspaceSnapshotError::SnapshotTooLarge));
-        let many = (0..129).map(|index| file(&format!("f{index}"), b"")).collect::<Vec<_>>();
+        assert_eq!(
+            encode(&total),
+            Err(WorkspaceSnapshotError::SnapshotTooLarge)
+        );
+        let many = (0..129)
+            .map(|index| file(&format!("f{index}"), b""))
+            .collect::<Vec<_>>();
         assert_eq!(encode(&many), Err(WorkspaceSnapshotError::TooManyFiles));
     }
 
     #[test]
     fn rejects_truncated_trailing_and_malformed_snapshots() {
         let encoded = encode(&[file("a", b"x")]).expect("encode");
-        assert_eq!(decode(&encoded[..encoded.len() - 1]), Err(WorkspaceSnapshotError::InvalidFormat));
+        assert_eq!(
+            decode(&encoded[..encoded.len() - 1]),
+            Err(WorkspaceSnapshotError::InvalidFormat)
+        );
         let mut trailing = encoded.clone();
         trailing.push(0);
-        assert_eq!(decode(&trailing), Err(WorkspaceSnapshotError::InvalidFormat));
-        assert_eq!(decode(b"bad!\0\0"), Err(WorkspaceSnapshotError::InvalidFormat));
+        assert_eq!(
+            decode(&trailing),
+            Err(WorkspaceSnapshotError::InvalidFormat)
+        );
+        assert_eq!(
+            decode(b"bad!\0\0"),
+            Err(WorkspaceSnapshotError::InvalidFormat)
+        );
     }
 
     #[test]
@@ -89,7 +269,45 @@ mod tests {
         let mut duplicate = first.clone();
         duplicate.extend_from_slice(&first[6..]);
         duplicate[4..6].copy_from_slice(&2_u16.to_be_bytes());
-        assert_eq!(decode(&duplicate), Err(WorkspaceSnapshotError::DuplicatePath));
+        assert_eq!(
+            decode(&duplicate),
+            Err(WorkspaceSnapshotError::DuplicatePath)
+        );
+    }
+
+    #[test]
+    fn decoding_rejects_invalid_paths_and_declared_bounds() {
+        let mut invalid_path = encode(&[file("a", b"x")]).expect("encode");
+        invalid_path[12] = b'.';
+        assert_eq!(
+            decode(&invalid_path),
+            Err(WorkspaceSnapshotError::InvalidPath)
+        );
+
+        let mut invalid_utf8 = encode(&[file("a", b"x")]).expect("encode");
+        invalid_utf8[12] = 0xff;
+        assert_eq!(
+            decode(&invalid_utf8),
+            Err(WorkspaceSnapshotError::InvalidPath)
+        );
+
+        let mut too_many = b"WNM1".to_vec();
+        too_many.extend_from_slice(&129_u16.to_be_bytes());
+        assert_eq!(decode(&too_many), Err(WorkspaceSnapshotError::TooManyFiles));
+
+        let mut oversized_file = b"WNM1".to_vec();
+        oversized_file.extend_from_slice(&1_u16.to_be_bytes());
+        oversized_file.extend_from_slice(&1_u16.to_be_bytes());
+        oversized_file.extend_from_slice(&1_048_577_u32.to_be_bytes());
+        assert_eq!(
+            decode(&oversized_file),
+            Err(WorkspaceSnapshotError::FileTooLarge)
+        );
+
+        assert_eq!(
+            decode(&vec![0; 16_777_217]),
+            Err(WorkspaceSnapshotError::SnapshotTooLarge)
+        );
     }
 
     #[test]
@@ -97,6 +315,12 @@ mod tests {
         let paths = BTreeSet::from(["a".to_owned(), "b/c".to_owned()]);
         let files = vec![file("b/c", b"2"), file("a", b"1")];
         let round_trip = decode(&encode(&files).expect("encode")).expect("decode");
-        assert_eq!(round_trip.into_iter().map(|entry| entry.path).collect::<BTreeSet<_>>(), paths);
+        assert_eq!(
+            round_trip
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<BTreeSet<_>>(),
+            paths
+        );
     }
 }

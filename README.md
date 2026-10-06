@@ -48,3 +48,12 @@ deployment model.
 Task output is treated as untrusted, potentially sensitive data. The manager
 bounds its size but does not redact arbitrary content; an integrating system
 must decide what output may become evidence or operator-visible.
+
+## Workspace snapshot contract
+
+The Rust library defines a versioned `WNM1` snapshot codec for regular-file
+contents. It accepts at most 128 files, 255 UTF-8 path bytes per file, 1 MiB per
+file, and 16 MiB total. Paths must be relative, slash-separated, normalized,
+unique, and cannot represent both a file and one of its descendants. Symlinks,
+permissions, and other filesystem metadata are not represented. The codec is
+not yet wired into `wardnm run`; task execution still receives argv only.
