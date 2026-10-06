@@ -57,3 +57,5 @@ file, and 16 MiB total. Paths must be relative, slash-separated, normalized,
 unique, and cannot represent both a file and one of its descendants. Symlinks,
 permissions, and other filesystem metadata are not represented. The codec is
 not yet wired into `wardnm run`; task execution still receives argv only.
+Snapshots can be converted to deterministic USTAR archives containing regular
+files only, as the bounded input format for a future no-host-mount transfer.
