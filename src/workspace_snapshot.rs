@@ -1,4 +1,7 @@
 use std::collections::BTreeSet;
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Component, Path};
 
 const MAGIC: &[u8; 4] = b"WNM1";
 const MAX_FILES: usize = 128;
@@ -7,6 +10,7 @@ const MAX_FILE_BYTES: usize = 1_048_576;
 pub const MAX_SNAPSHOT_BYTES: usize = 16_777_216;
 const TAR_BLOCK_BYTES: usize = 512;
 const MAX_TAR_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_FILES * 1024 + TAR_BLOCK_BYTES * 2;
+const MAX_DIRECTORY_ENTRIES: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceFile {
@@ -20,8 +24,11 @@ pub enum WorkspaceSnapshotError {
     InvalidPath,
     DuplicatePath,
     TooManyFiles,
+    TooManyEntries,
     FileTooLarge,
     SnapshotTooLarge,
+    UnsupportedFileType,
+    Filesystem,
 }
 
 pub fn encode(files: &[WorkspaceFile]) -> Result<Vec<u8>, WorkspaceSnapshotError> {
@@ -87,6 +94,109 @@ pub fn decode(encoded: &[u8]) -> Result<Vec<WorkspaceFile>, WorkspaceSnapshotErr
 
     validate_files(&files)?;
     Ok(files)
+}
+
+pub fn encode_directory(root: &Path) -> Result<Vec<u8>, WorkspaceSnapshotError> {
+    let metadata = fs::symlink_metadata(root).map_err(|_| WorkspaceSnapshotError::Filesystem)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(WorkspaceSnapshotError::UnsupportedFileType);
+    }
+
+    let root = root
+        .canonicalize()
+        .map_err(|_| WorkspaceSnapshotError::Filesystem)?;
+    let mut files = Vec::new();
+    let mut entry_count = 0;
+    let mut snapshot_bytes = 6;
+    collect_directory_files(
+        &root,
+        &root,
+        &mut files,
+        &mut entry_count,
+        &mut snapshot_bytes,
+    )?;
+    encode(&files)
+}
+
+fn collect_directory_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<WorkspaceFile>,
+    entry_count: &mut usize,
+    snapshot_bytes: &mut usize,
+) -> Result<(), WorkspaceSnapshotError> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|_| WorkspaceSnapshotError::Filesystem)? {
+        let entry = entry.map_err(|_| WorkspaceSnapshotError::Filesystem)?;
+        *entry_count += 1;
+        if *entry_count > MAX_DIRECTORY_ENTRIES {
+            return Err(WorkspaceSnapshotError::TooManyEntries);
+        }
+        entries.push(entry);
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|_| WorkspaceSnapshotError::Filesystem)?;
+        if file_type.is_symlink() {
+            return Err(WorkspaceSnapshotError::UnsupportedFileType);
+        }
+        if file_type.is_dir() {
+            collect_directory_files(root, &path, files, entry_count, snapshot_bytes)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(WorkspaceSnapshotError::UnsupportedFileType);
+        }
+        if files.len() == MAX_FILES {
+            return Err(WorkspaceSnapshotError::TooManyFiles);
+        }
+
+        let relative_path = snapshot_relative_path(root, &path)?;
+        if !valid_path(&relative_path) {
+            return Err(WorkspaceSnapshotError::InvalidPath);
+        }
+
+        let mut contents = Vec::new();
+        File::open(&path)
+            .map_err(|_| WorkspaceSnapshotError::Filesystem)?
+            .take(MAX_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut contents)
+            .map_err(|_| WorkspaceSnapshotError::Filesystem)?;
+        if contents.len() > MAX_FILE_BYTES {
+            return Err(WorkspaceSnapshotError::FileTooLarge);
+        }
+
+        *snapshot_bytes = snapshot_bytes
+            .checked_add(6 + relative_path.len() + contents.len())
+            .ok_or(WorkspaceSnapshotError::SnapshotTooLarge)?;
+        if *snapshot_bytes > MAX_SNAPSHOT_BYTES {
+            return Err(WorkspaceSnapshotError::SnapshotTooLarge);
+        }
+        files.push(WorkspaceFile {
+            path: relative_path,
+            contents,
+        });
+    }
+    Ok(())
+}
+
+fn snapshot_relative_path(root: &Path, path: &Path) -> Result<String, WorkspaceSnapshotError> {
+    path.strip_prefix(root)
+        .map_err(|_| WorkspaceSnapshotError::InvalidPath)?
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value
+                .to_str()
+                .map(str::to_owned)
+                .ok_or(WorkspaceSnapshotError::InvalidPath),
+            _ => Err(WorkspaceSnapshotError::InvalidPath),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|components| components.join("/"))
 }
 
 pub fn encode_tar(files: &[WorkspaceFile]) -> Result<Vec<u8>, WorkspaceSnapshotError> {
@@ -471,18 +581,18 @@ mod tests {
     #[test]
     fn encodes_directory_files_in_deterministic_path_order() {
         let directory = temporary_directory();
-        fs::create_dir(directory.join("src")).expect("create nested directory");
-        fs::write(directory.join("src/z.js"), b"last").expect("write nested file");
+        fs::create_dir(directory.join("a")).expect("create nested directory");
+        fs::write(directory.join("a/z.js"), b"last").expect("write nested file");
         fs::write(directory.join("a.js"), b"first").expect("write root file");
 
         let encoded = encode_directory(&directory).expect("encode directory");
         let files = decode(&encoded).expect("decode directory snapshot");
 
+        assert_eq!(files, [file("a.js", b"first"), file("a/z.js", b"last")]);
         assert_eq!(
-            files,
-            [file("a.js", b"first"), file("src/z.js", b"last")]
+            encoded,
+            encode_directory(&directory).expect("repeat encode")
         );
-        assert_eq!(encoded, encode_directory(&directory).expect("repeat encode"));
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
