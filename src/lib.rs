@@ -3,7 +3,7 @@
 pub mod workspace_snapshot;
 
 use std::ffi::OsString;
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -36,6 +36,7 @@ pub struct ManagerConfig {
 pub struct TaskSpec {
     pub id: String,
     pub argv: Vec<String>,
+    pub workspace_snapshot: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,6 +46,7 @@ pub enum ValidationError {
     Arguments,
     Image,
     Limits,
+    WorkspaceSnapshot,
 }
 
 impl std::fmt::Display for ValidationError {
@@ -55,6 +57,7 @@ impl std::fmt::Display for ValidationError {
             Self::Arguments => "arguments_invalid",
             Self::Image => "image_must_be_pinned_by_digest",
             Self::Limits => "resource_limits_out_of_bounds",
+            Self::WorkspaceSnapshot => "workspace_snapshot_invalid",
         };
         formatter.write_str(message)
     }
@@ -68,6 +71,7 @@ pub enum RunError {
     EngineUnavailable,
     EngineFailed,
     OutputReadFailed,
+    WorkspaceTransferFailed,
     Cancelled,
 }
 
@@ -78,6 +82,7 @@ impl std::fmt::Display for RunError {
             Self::EngineUnavailable => "container_engine_unavailable",
             Self::EngineFailed => "container_run_failed",
             Self::OutputReadFailed => "container_output_unavailable",
+            Self::WorkspaceTransferFailed => "workspace_transfer_failed",
             Self::Cancelled => "task_cancelled",
         };
         formatter.write_str(message)
@@ -131,10 +136,27 @@ pub fn build_docker_args(
     task: &TaskSpec,
     config: &ManagerConfig,
 ) -> Result<Vec<String>, ValidationError> {
+    build_docker_command(task, config).map(|(args, _)| args)
+}
+
+fn build_docker_command(
+    task: &TaskSpec,
+    config: &ManagerConfig,
+) -> Result<(Vec<String>, Option<Vec<u8>>), ValidationError> {
     validate(task, config)?;
+    let workspace_archive = task
+        .workspace_snapshot
+        .as_deref()
+        .map(|snapshot| {
+            let files = workspace_snapshot::decode(snapshot)
+                .map_err(|_| ValidationError::WorkspaceSnapshot)?;
+            workspace_snapshot::encode_tar(&files).map_err(|_| ValidationError::WorkspaceSnapshot)
+        })
+        .transpose()?;
+    let has_workspace = workspace_archive.is_some();
     let name = container_name(&config.run_id, &task.id);
     let limits = &config.limits;
-    let args = vec![
+    let mut args = vec![
         "run".into(),
         "--rm".into(),
         "--init".into(),
@@ -170,19 +192,39 @@ pub fn build_docker_args(
         ),
         "--tmpfs".into(),
         "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777,uid=65534,gid=65534".into(),
+    ];
+    if workspace_archive.is_some() {
+        args.push("--interactive".into());
+        args.extend([
+            "--tmpfs".into(),
+            "/workspace:rw,noexec,nosuid,nodev,size=32m,mode=0700,uid=65534,gid=65534".into(),
+        ]);
+    }
+    args.extend([
         "--workdir".into(),
-        "/tmp".into(),
+        if has_workspace { "/workspace" } else { "/tmp" }.into(),
         "--entrypoint".into(),
         "/bin/busybox".into(),
         config.image.clone(),
-        "timeout".into(),
-        "-s".into(),
-        "KILL".into(),
-        limits.wall_seconds.to_string(),
-    ];
-    let mut args = args;
+    ]);
+    if has_workspace {
+        args.extend([
+            "sh".into(),
+            "-c".into(),
+            "tar -xf - -C /workspace && wall_seconds=\"$1\" && shift && exec /bin/busybox timeout -s KILL \"$wall_seconds\" \"$@\"".into(),
+            "wardnm".into(),
+            limits.wall_seconds.to_string(),
+        ]);
+    } else {
+        args.extend([
+            "timeout".into(),
+            "-s".into(),
+            "KILL".into(),
+            limits.wall_seconds.to_string(),
+        ]);
+    }
     args.extend(task.argv.iter().cloned());
-    Ok(args)
+    Ok((args, workspace_archive))
 }
 
 pub fn container_name(run_id: &str, task_id: &str) -> String {
@@ -273,7 +315,8 @@ pub struct NodeManager {
 
 impl NodeManager {
     pub fn run(&self, task: &TaskSpec) -> Result<RunResult, RunError> {
-        let args = build_docker_args(task, &self.config).map_err(RunError::Invalid)?;
+        let (args, workspace_archive) =
+            build_docker_command(task, &self.config).map_err(RunError::Invalid)?;
         let name = container_name(&self.config.run_id, &task.id);
         let mut child = Command::new(&self.docker_binary)
             .arg("--context")
@@ -281,6 +324,11 @@ impl NodeManager {
             .args(args)
             .env_clear()
             .envs(docker_environment(std::env::vars_os()))
+            .stdin(if workspace_archive.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -291,12 +339,26 @@ impl NodeManager {
         let output_limit = self.config.limits.output_bytes;
         let stdout_reader = thread::spawn(move || capture_limited(stdout, output_limit));
         let stderr_reader = thread::spawn(move || capture_limited(stderr, output_limit));
+        let mut workspace_writer = match workspace_archive {
+            Some(archive) => match child.stdin.take() {
+                Some(mut stdin) => Some(thread::spawn(move || stdin.write_all(&archive))),
+                None => {
+                    let _ = child.kill();
+                    self.remove_container(&name);
+                    return Err(RunError::WorkspaceTransferFailed);
+                }
+            },
+            None => None,
+        };
         let deadline = Instant::now() + Duration::from_secs(self.config.limits.wall_seconds + 5);
         let mut timed_out = false;
         let status = loop {
             if self.cancelled.load(Ordering::Acquire) {
                 let _ = child.kill();
                 self.remove_container(&name);
+                if let Some(writer) = workspace_writer.take() {
+                    let _ = writer.join();
+                }
                 return Err(RunError::Cancelled);
             }
             match child.try_wait() {
@@ -306,16 +368,26 @@ impl NodeManager {
                     timed_out = true;
                     let _ = child.kill();
                     self.remove_container(&name);
+                    if let Some(writer) = workspace_writer.take() {
+                        let _ = writer.join();
+                    }
                     break child.wait().map_err(|_| RunError::EngineFailed)?;
                 }
                 Err(_) => {
                     let _ = child.kill();
                     self.remove_container(&name);
+                    if let Some(writer) = workspace_writer.take() {
+                        let _ = writer.join();
+                    }
                     return Err(RunError::EngineFailed);
                 }
             }
         };
         timed_out = container_timed_out(timed_out, status.code());
+        if workspace_writer.is_some_and(|writer| !matches!(writer.join(), Ok(Ok(())))) {
+            self.remove_container(&name);
+            return Err(RunError::WorkspaceTransferFailed);
+        }
         let (stdout, stdout_truncated) = stdout_reader
             .join()
             .map_err(|_| RunError::OutputReadFailed)?
@@ -353,7 +425,11 @@ mod tests {
     use super::capture_limited;
     use super::container_timed_out;
     use super::docker_environment;
+    use super::{Limits, ManagerConfig, NodeManager, TaskSpec, PINNED_IMAGE};
+    use crate::workspace_snapshot;
     use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::fs;
     use std::io::Cursor;
 
     #[test]
@@ -399,5 +475,65 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, ["HOME", "PATH", "DOCKER_CONFIG"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streams_only_the_encoded_archive_to_the_container_engine_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "wardnm-stdin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).expect("create test directory");
+        let docker = directory.join("docker");
+        fs::write(&docker, "#!/bin/sh\ncat > \"$0.input\"\n").expect("write fake engine");
+        let mut permissions = fs::metadata(&docker)
+            .expect("engine metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&docker, permissions).expect("make fake engine executable");
+
+        let files = [workspace_snapshot::WorkspaceFile {
+            path: "src/main.js".into(),
+            contents: b"process.exit(0)".to_vec(),
+        }];
+        let snapshot = workspace_snapshot::encode(&files).expect("encode snapshot");
+        let expected_archive = workspace_snapshot::encode_tar(&files).expect("encode archive");
+        let manager = NodeManager {
+            config: ManagerConfig {
+                image: PINNED_IMAGE.into(),
+                run_id: "run-test".into(),
+                limits: Limits {
+                    wall_seconds: 10,
+                    memory_bytes: 128 * 1024 * 1024,
+                    cpu_millis: 500,
+                    pids: 32,
+                    output_bytes: 4096,
+                },
+            },
+            docker_binary: docker.to_string_lossy().into_owned(),
+            cancelled: Default::default(),
+        };
+
+        let result = manager
+            .run(&TaskSpec {
+                id: "task-test".into(),
+                argv: vec!["node".into(), "src/main.js".into()],
+                workspace_snapshot: Some(snapshot),
+            })
+            .expect("run fake engine");
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            fs::read(directory.join("docker.input")).expect("captured stdin"),
+            expected_archive
+        );
+
+        fs::remove_dir_all(directory).expect("remove test directory");
     }
 }

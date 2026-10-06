@@ -55,7 +55,14 @@ The Rust library defines a versioned `WNM1` snapshot codec for regular-file
 contents. It accepts at most 128 files, 255 UTF-8 path bytes per file, 1 MiB per
 file, and 16 MiB total. Paths must be relative, slash-separated, normalized,
 unique, and cannot represent both a file and one of its descendants. Symlinks,
-permissions, and other filesystem metadata are not represented. The codec is
-not yet wired into `wardnm run`; task execution still receives argv only.
-Snapshots can be converted to deterministic USTAR archives containing regular
-files only, as the bounded input format for a future no-host-mount transfer.
+permissions, and other filesystem metadata are not represented. The library
+can convert snapshots to deterministic USTAR archives containing regular
+files only.
+
+`wardnm run --snapshot FILE -- COMMAND ...` reads at most 16 MiB of WNM1 data,
+validates and converts it before starting Docker, then streams the archive over
+Docker stdin into a private 32 MiB `/workspace` tmpfs. The task runs with
+`/workspace` as its working directory. No host path is mounted into the task;
+the tmpfs is bounded by the container memory limit and removed with the
+container. When a snapshot is supplied, stdin is reserved for workspace
+transfer and the task receives EOF rather than independent input.

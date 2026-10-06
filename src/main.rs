@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+use std::fs::File;
+use std::io::Read;
+use ward_node_manager::workspace_snapshot::MAX_SNAPSHOT_BYTES;
 use ward_node_manager::{Limits, ManagerConfig, NodeManager, TaskSpec, PINNED_IMAGE};
 
 fn main() {
@@ -24,6 +27,7 @@ fn run() -> Result<i32, String> {
 
     let mut run_id = format!("run-{}-{}", std::process::id(), timestamp_nanos());
     let mut task_id = None;
+    let mut workspace_snapshot = None;
     let mut limits = Limits {
         wall_seconds: 30,
         memory_bytes: 256 * 1024 * 1024,
@@ -41,6 +45,7 @@ fn run() -> Result<i32, String> {
         match arg.as_str() {
             "--run-id" => run_id = value,
             "--task-id" => task_id = Some(value),
+            "--snapshot" => workspace_snapshot = Some(read_snapshot(&value)?),
             "--wall-seconds" => limits.wall_seconds = parse(&value)?,
             "--memory-bytes" => limits.memory_bytes = parse(&value)?,
             "--cpu-millis" => limits.cpu_millis = parse(&value)?,
@@ -55,6 +60,7 @@ fn run() -> Result<i32, String> {
     let task = TaskSpec {
         id: task_id.ok_or("task_id_required")?,
         argv: command,
+        workspace_snapshot,
     };
     let config = ManagerConfig {
         image: PINNED_IMAGE.into(),
@@ -88,6 +94,18 @@ fn run() -> Result<i32, String> {
         }
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn read_snapshot(path: &str) -> Result<Vec<u8>, String> {
+    let file = File::open(path).map_err(|_| "snapshot_unavailable")?;
+    let mut encoded = Vec::new();
+    file.take((MAX_SNAPSHOT_BYTES + 1) as u64)
+        .read_to_end(&mut encoded)
+        .map_err(|_| "snapshot_unavailable")?;
+    if encoded.len() > MAX_SNAPSHOT_BYTES {
+        return Err("workspace_snapshot_invalid".into());
+    }
+    Ok(encoded)
 }
 
 fn parse<T: std::str::FromStr>(value: &str) -> Result<T, String> {
