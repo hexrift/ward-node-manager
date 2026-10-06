@@ -70,3 +70,12 @@ Docker stdin into a private 32 MiB `/workspace` tmpfs. The task runs with
 the tmpfs is bounded by the container memory limit and removed with the
 container. When a snapshot is supplied, stdin is reserved for workspace
 transfer and the task receives EOF rather than independent input.
+
+## Docker acceptance
+
+With Docker running and the pinned task image already present, run the opt-in
+pack/transfer/execute/cleanup acceptance test:
+
+```sh
+cargo test --offline --test docker_acceptance -- --ignored
+```
