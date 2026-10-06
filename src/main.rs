@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
-use std::fs::File;
-use std::io::Read;
-use ward_node_manager::workspace_snapshot::MAX_SNAPSHOT_BYTES;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::Path;
+use ward_node_manager::workspace_snapshot::{encode_directory, MAX_SNAPSHOT_BYTES};
 use ward_node_manager::{Limits, ManagerConfig, NodeManager, TaskSpec, PINNED_IMAGE};
 
 fn main() {
@@ -21,8 +22,10 @@ fn main() {
 
 fn run() -> Result<i32, String> {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("run") {
-        return Err("usage_invalid".into());
+    match args.next().as_deref() {
+        Some("snapshot") => return pack_snapshot(args),
+        Some("run") => {}
+        _ => return Err("usage_invalid".into()),
     }
 
     let mut run_id = format!("run-{}-{}", std::process::id(), timestamp_nanos());
@@ -94,6 +97,33 @@ fn run() -> Result<i32, String> {
         }
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn pack_snapshot(mut args: impl Iterator<Item = String>) -> Result<i32, String> {
+    if args.next().as_deref() != Some("pack") {
+        return Err("usage_invalid".into());
+    }
+    let source = args.next().ok_or("usage_invalid")?;
+    let output = args.next().ok_or("usage_invalid")?;
+    if args.next().is_some() {
+        return Err("usage_invalid".into());
+    }
+
+    let snapshot =
+        encode_directory(Path::new(&source)).map_err(|_| "workspace_snapshot_invalid")?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output)
+        .map_err(|_| "snapshot_output_unavailable")?;
+    if file.write_all(&snapshot).is_err() {
+        drop(file);
+        let _ = fs::remove_file(output);
+        return Err("snapshot_output_unavailable".into());
+    }
+
+    println!("{{\"status\":\"packed\",\"bytes\":{}}}", snapshot.len());
+    Ok(0)
 }
 
 fn read_snapshot(path: &str) -> Result<Vec<u8>, String> {
