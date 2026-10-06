@@ -72,6 +72,7 @@ pub enum RunError {
     EngineFailed,
     OutputReadFailed,
     WorkspaceTransferFailed,
+    CleanupFailed,
     Cancelled,
 }
 
@@ -83,6 +84,7 @@ impl std::fmt::Display for RunError {
             Self::EngineFailed => "container_run_failed",
             Self::OutputReadFailed => "container_output_unavailable",
             Self::WorkspaceTransferFailed => "workspace_transfer_failed",
+            Self::CleanupFailed => "container_cleanup_failed",
             Self::Cancelled => "task_cancelled",
         };
         formatter.write_str(message)
@@ -344,7 +346,10 @@ impl NodeManager {
                 Some(mut stdin) => Some(thread::spawn(move || stdin.write_all(&archive))),
                 None => {
                     let _ = child.kill();
-                    self.remove_container(&name);
+                    let _ = child.wait();
+                    if self.remove_container(&name).is_err() {
+                        return Err(RunError::CleanupFailed);
+                    }
                     return Err(RunError::WorkspaceTransferFailed);
                 }
             },
@@ -355,10 +360,11 @@ impl NodeManager {
         let status = loop {
             if self.cancelled.load(Ordering::Acquire) {
                 let _ = child.kill();
-                self.remove_container(&name);
                 if let Some(writer) = workspace_writer.take() {
                     let _ = writer.join();
                 }
+                let _ = child.wait();
+                self.remove_container(&name)?;
                 return Err(RunError::Cancelled);
             }
             match child.try_wait() {
@@ -367,25 +373,27 @@ impl NodeManager {
                 Ok(None) => {
                     timed_out = true;
                     let _ = child.kill();
-                    self.remove_container(&name);
                     if let Some(writer) = workspace_writer.take() {
                         let _ = writer.join();
                     }
-                    break child.wait().map_err(|_| RunError::EngineFailed)?;
+                    let status = child.wait();
+                    self.remove_container(&name)?;
+                    break status.map_err(|_| RunError::EngineFailed)?;
                 }
                 Err(_) => {
                     let _ = child.kill();
-                    self.remove_container(&name);
                     if let Some(writer) = workspace_writer.take() {
                         let _ = writer.join();
                     }
+                    let _ = child.wait();
+                    self.remove_container(&name)?;
                     return Err(RunError::EngineFailed);
                 }
             }
         };
         timed_out = container_timed_out(timed_out, status.code());
         if workspace_writer.is_some_and(|writer| !matches!(writer.join(), Ok(Ok(())))) {
-            self.remove_container(&name);
+            self.remove_container(&name)?;
             return Err(RunError::WorkspaceTransferFailed);
         }
         let (stdout, stdout_truncated) = stdout_reader
@@ -407,8 +415,8 @@ impl NodeManager {
         })
     }
 
-    fn remove_container(&self, name: &str) {
-        let _ = Command::new(&self.docker_binary)
+    fn remove_container(&self, name: &str) -> Result<(), RunError> {
+        let status = Command::new(&self.docker_binary)
             .arg("--context")
             .arg("default")
             .args(["rm", "--force", "--", name])
@@ -416,7 +424,13 @@ impl NodeManager {
             .envs(docker_environment(std::env::vars_os()))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status()
+            .map_err(|_| RunError::CleanupFailed)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(RunError::CleanupFailed)
+        }
     }
 }
 
@@ -426,13 +440,15 @@ mod tests {
     use super::container_timed_out;
     use super::docker_environment;
     #[cfg(unix)]
-    use super::{Limits, ManagerConfig, NodeManager, TaskSpec, PINNED_IMAGE};
+    use super::{Limits, ManagerConfig, NodeManager, RunError, TaskSpec, PINNED_IMAGE};
     #[cfg(unix)]
     use crate::workspace_snapshot;
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::fs;
     use std::io::Cursor;
+    #[cfg(unix)]
+    use std::path::PathBuf;
 
     #[test]
     fn captures_only_the_configured_output_prefix_and_drains_the_rest() {
@@ -536,6 +552,83 @@ mod tests {
             expected_archive
         );
 
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    fn cancelled_manager(cleanup_exit_code: i32) -> (PathBuf, NodeManager) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "wardnm-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).expect("create test directory");
+        let docker = directory.join("docker");
+        fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nif [ \"$3\" = rm ]; then printf '%s\\n' \"$@\" > \"$0.cleanup\"; exit {cleanup_exit_code}; fi\nexec sleep 30\n"
+            ),
+        )
+        .expect("write fake engine");
+        let mut permissions = fs::metadata(&docker)
+            .expect("engine metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&docker, permissions).expect("make fake engine executable");
+
+        let manager = NodeManager {
+            config: ManagerConfig {
+                image: PINNED_IMAGE.into(),
+                run_id: "run-test".into(),
+                limits: Limits {
+                    wall_seconds: 10,
+                    memory_bytes: 128 * 1024 * 1024,
+                    cpu_millis: 500,
+                    pids: 32,
+                    output_bytes: 4096,
+                },
+            },
+            docker_binary: docker.to_string_lossy().into_owned(),
+            cancelled: std::sync::atomic::AtomicBool::new(true),
+        };
+
+        (directory, manager)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_cancelled_after_forced_container_cleanup_succeeds() {
+        let (directory, manager) = cancelled_manager(0);
+        let result = manager.run(&TaskSpec {
+            id: "task-test".into(),
+            argv: vec!["true".into()],
+            workspace_snapshot: None,
+        });
+
+        assert!(matches!(result, Err(RunError::Cancelled)));
+        assert!(fs::read_to_string(directory.join("docker.cleanup"))
+            .expect("cleanup invocation")
+            .contains("--force"));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_cleanup_failure_instead_of_claiming_cancelled() {
+        let (directory, manager) = cancelled_manager(1);
+        let result = manager.run(&TaskSpec {
+            id: "task-test".into(),
+            argv: vec!["true".into()],
+            workspace_snapshot: None,
+        });
+
+        assert!(matches!(result, Err(RunError::CleanupFailed)));
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 }
