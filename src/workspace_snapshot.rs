@@ -4,7 +4,7 @@ const MAGIC: &[u8; 4] = b"WNM1";
 const MAX_FILES: usize = 128;
 const MAX_PATH_BYTES: usize = 255;
 const MAX_FILE_BYTES: usize = 1_048_576;
-const MAX_SNAPSHOT_BYTES: usize = 16_777_216;
+pub const MAX_SNAPSHOT_BYTES: usize = 16_777_216;
 const TAR_BLOCK_BYTES: usize = 512;
 const MAX_TAR_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_FILES * 1024 + TAR_BLOCK_BYTES * 2;
 
