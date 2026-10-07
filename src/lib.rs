@@ -722,6 +722,7 @@ mod tests {
                 OsString::from("DOCKER_CONFIG"),
                 OsString::from("/tmp/docker"),
             ),
+            (OsString::from("DOCKER_CONTEXT"), OsString::from("colima")),
             (OsString::from("OPENAI_API_KEY"), OsString::from("secret")),
             (OsString::from("GH_TOKEN"), OsString::from("secret")),
             (
@@ -734,7 +735,7 @@ mod tests {
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["HOME", "PATH", "DOCKER_CONFIG"]);
+        assert_eq!(names, ["HOME", "PATH", "DOCKER_CONFIG", "DOCKER_CONTEXT"]);
     }
 
     #[cfg(unix)]
@@ -808,7 +809,7 @@ mod tests {
         let docker = directory.join("docker");
         fs::write(
             &docker,
-            "#!/bin/sh\ncase \"$3\" in\ncreate) printf 'container-id\\n' ;;\nstart) cat > \"$0.input\"; printf 'WNMOUT1\\n11\\n0\\n0\\n0\\ntask-output'; cat \"$0.archive\" ;;\nrm) printf '%s\\n' \"$@\" > \"$0.cleanup\" ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\ncreate) printf 'container-id\\n' ;;\nstart) cat > \"$0.input\"; printf 'WNMOUT1\\n11\\n0\\n0\\n0\\ntask-output'; cat \"$0.archive\" ;;\nrm) printf '%s\\n' \"$@\" > \"$0.cleanup\" ;;\nesac\n",
         )
         .expect("write fake engine");
         let mut permissions = fs::metadata(&docker)
@@ -885,7 +886,7 @@ mod tests {
         fs::write(
             &docker,
             format!(
-                "#!/bin/sh\nif [ \"$3\" = rm ]; then printf '%s\\n' \"$@\" > \"$0.cleanup\"; exit {cleanup_exit_code}; fi\nexec sleep 30\n"
+                "#!/bin/sh\nif [ \"$1\" = rm ]; then printf '%s\\n' \"$@\" > \"$0.cleanup\"; exit {cleanup_exit_code}; fi\nexec sleep 30\n"
             ),
         )
         .expect("write fake engine");
