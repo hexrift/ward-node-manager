@@ -411,6 +411,7 @@ fn docker_environment(
         "TEMP",
         "TMP",
         "DOCKER_CONFIG",
+        "DOCKER_CONTEXT",
     ];
 
     environment
@@ -456,8 +457,6 @@ impl NodeManager {
             args[0] = "create".into();
             args.retain(|argument| argument != "--rm");
             let created = Command::new(&self.docker_binary)
-                .arg("--context")
-                .arg("default")
                 .args(args.iter())
                 .env_clear()
                 .envs(docker_environment(std::env::vars_os()))
@@ -471,7 +470,6 @@ impl NodeManager {
             }
         }
         let mut command = Command::new(&self.docker_binary);
-        command.arg("--context").arg("default");
         if capture_workspace_snapshot {
             command.args(["start", "--attach", "--interactive", &name]);
         } else {
@@ -617,8 +615,6 @@ impl NodeManager {
 
     fn remove_container(&self, name: &str) -> Result<(), RunError> {
         let status = Command::new(&self.docker_binary)
-            .arg("--context")
-            .arg("default")
             .args(["rm", "--force", "--", name])
             .env_clear()
             .envs(docker_environment(std::env::vars_os()))
