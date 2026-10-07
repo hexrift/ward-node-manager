@@ -6,8 +6,9 @@ is a small Rust CLI with no third-party crate dependencies.
 ## Requirements
 
 Rust 1.88 or later, Cargo, and Docker with a running Linux container engine.
-The configured Alpine image must already be present locally; task containers
-never pull images or access the network.
+WardNM honors the Docker context selected by the operator. The configured
+Alpine image must already be present locally; task containers never pull images
+or access the network.
 
 ## Test and build
 
