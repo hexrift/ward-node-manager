@@ -14,7 +14,9 @@ fn config() -> ManagerConfig {
             cpu_millis: 500,
             pids: 32,
             output_bytes: 4096,
+            workspace_bytes: 33_554_432,
         },
+        workspace_executable: false,
     }
 }
 
@@ -143,6 +145,66 @@ fn transfers_validated_workspace_without_host_mounts() {
             "src/main.js"
         ]
     );
+}
+
+fn workspace_task() -> TaskSpec {
+    TaskSpec {
+        id: "worker-a".into(),
+        argv: vec!["make".into(), "test".into()],
+        workspace_snapshot: Some(
+            encode(&[WorkspaceFile {
+                path: "Makefile".into(),
+                contents: b"test:\n".to_vec(),
+            }])
+            .expect("snapshot"),
+        ),
+    }
+}
+
+#[test]
+fn sizes_the_workspace_and_lets_built_tests_execute_only_when_configured() {
+    let mut large = config();
+    large.limits.memory_bytes = 4 * 1024 * 1024 * 1024;
+    large.limits.workspace_bytes = 2 * 1024 * 1024 * 1024;
+    large.workspace_executable = true;
+
+    let args = build_docker_args(&workspace_task(), &large).expect("valid large workspace");
+
+    assert!(args.windows(2).any(|pair| {
+        pair == [
+            "--tmpfs",
+            "/workspace:rw,exec,nosuid,nodev,size=2048m,mode=0700,uid=65534,gid=65534",
+        ]
+    }));
+    assert!(args.windows(2).any(|pair| {
+        pair == [
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777,uid=65534,gid=65534",
+        ]
+    }));
+
+    let mut odd = config();
+    odd.limits.workspace_bytes = 33_554_433;
+    let args = build_docker_args(&workspace_task(), &odd).expect("valid odd-sized workspace");
+    assert!(args.iter().any(|argument| argument
+        == "/workspace:rw,noexec,nosuid,nodev,size=33554433,mode=0700,uid=65534,gid=65534"));
+}
+
+#[test]
+fn refuses_a_workspace_smaller_than_the_default_larger_than_memory_or_over_eight_gibibytes() {
+    for (memory_bytes, workspace_bytes) in [
+        (134_217_728, 33_554_431),
+        (134_217_728, 134_217_729),
+        (8 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024 + 1),
+    ] {
+        let mut refused = config();
+        refused.limits.memory_bytes = memory_bytes;
+        refused.limits.workspace_bytes = workspace_bytes;
+        assert!(matches!(
+            build_docker_args(&workspace_task(), &refused),
+            Err(ValidationError::Limits)
+        ));
+    }
 }
 
 #[test]

@@ -24,6 +24,7 @@ pub struct Limits {
     pub cpu_millis: u32,
     pub pids: u32,
     pub output_bytes: usize,
+    pub workspace_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +32,7 @@ pub struct ManagerConfig {
     pub image: String,
     pub run_id: String,
     pub limits: Limits,
+    pub workspace_executable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +190,17 @@ fn read_frame_bytes<'a>(
     Ok(bytes)
 }
 
+pub const DEFAULT_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_WORKSPACE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+fn tmpfs_size(bytes: u64) -> String {
+    if bytes.is_multiple_of(1024 * 1024) {
+        format!("{}m", bytes / (1024 * 1024))
+    } else {
+        bytes.to_string()
+    }
+}
+
 pub fn validate(task: &TaskSpec, config: &ManagerConfig) -> Result<(), ValidationError> {
     if !safe_identifier(&task.id, 48) {
         return Err(ValidationError::TaskId);
@@ -213,6 +226,8 @@ pub fn validate(task: &TaskSpec, config: &ManagerConfig) -> Result<(), Validatio
         || !(100..=8000).contains(&limits.cpu_millis)
         || !(1..=256).contains(&limits.pids)
         || !(1..=MAX_OUTPUT_BYTES).contains(&limits.output_bytes)
+        || !(DEFAULT_WORKSPACE_BYTES..=MAX_WORKSPACE_BYTES).contains(&limits.workspace_bytes)
+        || limits.workspace_bytes > limits.memory_bytes
     {
         return Err(ValidationError::Limits);
     }
@@ -285,7 +300,15 @@ fn build_docker_command(
         args.push("--interactive".into());
         args.extend([
             "--tmpfs".into(),
-            "/workspace:rw,noexec,nosuid,nodev,size=32m,mode=0700,uid=65534,gid=65534".into(),
+            format!(
+                "/workspace:rw,{},nosuid,nodev,size={},mode=0700,uid=65534,gid=65534",
+                if config.workspace_executable {
+                    "exec"
+                } else {
+                    "noexec"
+                },
+                tmpfs_size(limits.workspace_bytes)
+            ),
         ]);
     }
     args.extend([
@@ -641,6 +664,8 @@ mod tests {
     use super::decode_workspace_result_frame;
     use super::docker_environment;
     #[cfg(unix)]
+    use super::DEFAULT_WORKSPACE_BYTES;
+    #[cfg(unix)]
     use super::{Limits, ManagerConfig, NodeManager, RunError, TaskSpec, PINNED_IMAGE};
     use crate::workspace_snapshot;
     use std::ffi::OsString;
@@ -772,7 +797,9 @@ mod tests {
                     cpu_millis: 500,
                     pids: 32,
                     output_bytes: 4096,
+                    workspace_bytes: DEFAULT_WORKSPACE_BYTES,
                 },
+                workspace_executable: false,
             },
             docker_binary: docker.to_string_lossy().into_owned(),
             cancelled: Default::default(),
@@ -837,7 +864,9 @@ mod tests {
                     cpu_millis: 500,
                     pids: 32,
                     output_bytes: 4096,
+                    workspace_bytes: DEFAULT_WORKSPACE_BYTES,
                 },
+                workspace_executable: false,
             },
             docker_binary: docker.to_string_lossy().into_owned(),
             cancelled: Default::default(),
@@ -905,7 +934,9 @@ mod tests {
                     cpu_millis: 500,
                     pids: 32,
                     output_bytes: 4096,
+                    workspace_bytes: DEFAULT_WORKSPACE_BYTES,
                 },
+                workspace_executable: false,
             },
             docker_binary: docker.to_string_lossy().into_owned(),
             cancelled: std::sync::atomic::AtomicBool::new(true),
