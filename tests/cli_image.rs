@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -37,7 +39,6 @@ fn wardnm(path: &PathBuf, args: &[&str]) -> std::process::Output {
         .expect("run wardnm")
 }
 
-#[cfg(unix)]
 #[test]
 fn runs_the_task_in_an_operator_chosen_image_pinned_by_digest() {
     let (directory, log) = fake_docker("pinned");
