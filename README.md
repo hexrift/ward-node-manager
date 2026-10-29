@@ -26,6 +26,13 @@ target/release/wardnm run --run-id demo --task-id task-1 -- /bin/busybox printf 
 The CLI emits a bounded JSON result. Nonzero task exits and timeouts return a
 nonzero CLI exit status.
 
+`--image NAME@sha256:DIGEST` runs the task in another image, such as one with a
+project's compiler and test tools. The reference must be pinned by digest; a tag
+is refused with `image_must_be_pinned_by_digest` before Docker is called. The
+image must already be present locally, because tasks never pull, and must
+provide `/bin/busybox`, which is the task entrypoint. Without `--image` the task
+runs in the pinned Alpine image.
+
 ## Container boundary
 
 The manager pins the image by digest, never pulls during task execution, passes
