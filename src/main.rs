@@ -4,7 +4,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 use ward_node_manager::workspace_snapshot::{encode_directory, MAX_SNAPSHOT_BYTES};
-use ward_node_manager::{Limits, ManagerConfig, NodeManager, TaskSpec, PINNED_IMAGE};
+use ward_node_manager::{
+    Limits, ManagerConfig, NodeManager, TaskSpec, DEFAULT_WORKSPACE_BYTES, PINNED_IMAGE,
+};
 
 fn main() {
     let code = match run() {
@@ -30,6 +32,7 @@ fn run() -> Result<i32, String> {
 
     let mut run_id = format!("run-{}-{}", std::process::id(), timestamp_nanos());
     let mut task_id = None;
+    let mut image = PINNED_IMAGE.to_owned();
     let mut workspace_snapshot = None;
     let mut workspace_snapshot_output = None;
     let mut limits = Limits {
@@ -38,7 +41,9 @@ fn run() -> Result<i32, String> {
         cpu_millis: 1000,
         pids: 32,
         output_bytes: 4096,
+        workspace_bytes: DEFAULT_WORKSPACE_BYTES,
     };
+    let mut workspace_executable = false;
     let mut command = Vec::new();
     while let Some(arg) = args.next() {
         if arg == "--" {
@@ -49,6 +54,7 @@ fn run() -> Result<i32, String> {
         match arg.as_str() {
             "--run-id" => run_id = value,
             "--task-id" => task_id = Some(value),
+            "--image" => image = value,
             "--snapshot" => workspace_snapshot = Some(read_snapshot(&value)?),
             "--snapshot-output" => workspace_snapshot_output = Some(value),
             "--wall-seconds" => limits.wall_seconds = parse(&value)?,
@@ -56,6 +62,14 @@ fn run() -> Result<i32, String> {
             "--cpu-millis" => limits.cpu_millis = parse(&value)?,
             "--pids" => limits.pids = parse(&value)?,
             "--output-bytes" => limits.output_bytes = parse(&value)?,
+            "--workspace-bytes" => limits.workspace_bytes = parse(&value)?,
+            "--workspace-mode" => {
+                workspace_executable = match value.as_str() {
+                    "exec" => true,
+                    "noexec" => false,
+                    _ => return Err("workspace_mode_invalid".into()),
+                }
+            }
             _ => return Err("option_invalid".into()),
         }
     }
@@ -68,9 +82,10 @@ fn run() -> Result<i32, String> {
         workspace_snapshot,
     };
     let config = ManagerConfig {
-        image: PINNED_IMAGE.into(),
+        image,
         run_id,
         limits,
+        workspace_executable,
     };
     let manager = NodeManager {
         config,

@@ -26,6 +26,13 @@ target/release/wardnm run --run-id demo --task-id task-1 -- /bin/busybox printf 
 The CLI emits a bounded JSON result. Nonzero task exits and timeouts return a
 nonzero CLI exit status.
 
+`--image NAME@sha256:DIGEST` runs the task in another image, such as one with a
+project's compiler and test tools. The reference must be pinned by digest; a tag
+is refused with `image_must_be_pinned_by_digest` before Docker is called. The
+image must already be present locally, because tasks never pull, and must
+provide `/bin/busybox`, which is the task entrypoint. Without `--image` the task
+runs in the pinned Alpine image.
+
 ## Container boundary
 
 The manager pins the image by digest, never pulls during task execution, passes
@@ -70,6 +77,19 @@ Docker stdin into a private 32 MiB `/workspace` tmpfs. The task runs with
 the tmpfs is bounded by the container memory limit and removed with the
 container. When a snapshot is supplied, stdin is reserved for workspace
 transfer and the task receives EOF rather than independent input.
+
+The workspace is 32 MiB and `noexec` by default. A task that builds and runs
+tests, such as a proof-of-concept test against a project's own suite, needs
+more space and must execute what it builds. The operator can opt in per run:
+
+- `--workspace-bytes N` sizes the `/workspace` tmpfs, from 32 MiB up to the
+  task's `--memory-bytes` and at most 8 GiB. Because tmpfs pages count against
+  the container memory limit, the workspace can never exceed it.
+- `--workspace-mode exec` mounts `/workspace` with `exec` instead of `noexec`.
+  `nosuid` and `nodev` stay, `/tmp` stays 16 MiB and `noexec`, and the task
+  still runs as `65534:65534` with no network, a read-only root filesystem and
+  all capabilities dropped. Only files the task wrote into its own workspace
+  become executable.
 
 ## Docker acceptance
 
