@@ -4,13 +4,13 @@ use std::io::Read;
 use std::path::{Component, Path};
 
 const MAGIC: &[u8; 4] = b"WNM1";
-const MAX_FILES: usize = 128;
+const MAX_FILES: usize = 32_768;
 const MAX_PATH_BYTES: usize = 255;
-const MAX_FILE_BYTES: usize = 1_048_576;
-pub const MAX_SNAPSHOT_BYTES: usize = 16_777_216;
+const MAX_FILE_BYTES: usize = 67_108_864;
+pub const MAX_SNAPSHOT_BYTES: usize = 536_870_912;
 const TAR_BLOCK_BYTES: usize = 512;
 pub const MAX_TAR_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_FILES * 1024 + TAR_BLOCK_BYTES * 2;
-const MAX_DIRECTORY_ENTRIES: usize = 512;
+const MAX_DIRECTORY_ENTRIES: usize = 262_144;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceFile {
@@ -603,17 +603,17 @@ mod tests {
     #[test]
     fn rejects_snapshots_outside_file_and_total_bounds() {
         assert_eq!(
-            encode(&[file("large", &vec![0; 1_048_577])]),
+            encode(&[file("large", &vec![0; 67_108_865])]),
             Err(WorkspaceSnapshotError::FileTooLarge),
         );
-        let total = (0..17)
-            .map(|index| file(&format!("f{index}"), &vec![0; 1_000_000]))
+        let total = (0..9)
+            .map(|index| file(&format!("f{index}"), &vec![0; 64 * 1024 * 1024]))
             .collect::<Vec<_>>();
         assert_eq!(
             encode(&total),
             Err(WorkspaceSnapshotError::SnapshotTooLarge)
         );
-        let many = (0..129)
+        let many = (0..32_769)
             .map(|index| file(&format!("f{index}"), b""))
             .collect::<Vec<_>>();
         assert_eq!(encode(&many), Err(WorkspaceSnapshotError::TooManyFiles));
@@ -667,20 +667,20 @@ mod tests {
         );
 
         let mut too_many = b"WNM1".to_vec();
-        too_many.extend_from_slice(&129_u16.to_be_bytes());
+        too_many.extend_from_slice(&32_769_u16.to_be_bytes());
         assert_eq!(decode(&too_many), Err(WorkspaceSnapshotError::TooManyFiles));
 
         let mut oversized_file = b"WNM1".to_vec();
         oversized_file.extend_from_slice(&1_u16.to_be_bytes());
         oversized_file.extend_from_slice(&1_u16.to_be_bytes());
-        oversized_file.extend_from_slice(&1_048_577_u32.to_be_bytes());
+        oversized_file.extend_from_slice(&67_108_865_u32.to_be_bytes());
         assert_eq!(
             decode(&oversized_file),
             Err(WorkspaceSnapshotError::FileTooLarge)
         );
 
         assert_eq!(
-            decode(&vec![0; 16_777_217]),
+            decode(&vec![0; 536_870_913]),
             Err(WorkspaceSnapshotError::SnapshotTooLarge)
         );
     }

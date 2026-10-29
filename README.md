@@ -59,18 +59,24 @@ must decide what output may become evidence or operator-visible.
 ## Workspace snapshot contract
 
 The Rust library defines a versioned `WNM1` snapshot codec for regular-file
-contents. It accepts at most 128 files, 255 UTF-8 path bytes per file, 1 MiB per
-file, and 16 MiB total. Paths must be relative, slash-separated, normalized,
+contents. It accepts at most 32,768 files, 255 UTF-8 path bytes per file, 64 MiB
+per file, and 512 MiB total, enough for a checkout of most open-source
+repositories without their build output. Paths must be relative, slash-separated, normalized,
 unique, and cannot represent both a file and one of its descendants. Symlinks,
 permissions, and other filesystem metadata are not represented. The library
 can pack a directory into WNM1, rejecting symlinks and special files while
-bounding traversal to 512 entries. It can also convert snapshots to
+bounding traversal to 262,144 directory entries. It can also convert snapshots to
 deterministic USTAR archives containing regular files only.
+`wardnm` holds the snapshot, its decoded files and the archive in memory while
+it starts the task, so packing or running a snapshot near the limit needs
+about three times its size in host memory. The archive must also fit the
+`/workspace` tmpfs: a snapshot larger than the workspace fails when the task
+unpacks it, and the run is reported as failed.
 
 `wardnm snapshot pack DIRECTORY OUTPUT` creates a WNM1 snapshot and refuses to
 overwrite an existing output file.
 
-`wardnm run --snapshot FILE -- COMMAND ...` reads at most 16 MiB of WNM1 data,
+`wardnm run --snapshot FILE -- COMMAND ...` reads at most 512 MiB of WNM1 data,
 validates and converts it before starting Docker, then streams the archive over
 Docker stdin into a private 32 MiB `/workspace` tmpfs. The task runs with
 `/workspace` as its working directory. No host path is mounted into the task;
