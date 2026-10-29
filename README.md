@@ -71,6 +71,19 @@ the tmpfs is bounded by the container memory limit and removed with the
 container. When a snapshot is supplied, stdin is reserved for workspace
 transfer and the task receives EOF rather than independent input.
 
+The workspace is 32 MiB and `noexec` by default. A task that builds and runs
+tests, such as a proof-of-concept test against a project's own suite, needs
+more space and must execute what it builds. The operator can opt in per run:
+
+- `--workspace-bytes N` sizes the `/workspace` tmpfs, from 32 MiB up to the
+  task's `--memory-bytes` and at most 8 GiB. Because tmpfs pages count against
+  the container memory limit, the workspace can never exceed it.
+- `--workspace-mode exec` mounts `/workspace` with `exec` instead of `noexec`.
+  `nosuid` and `nodev` stay, `/tmp` stays 16 MiB and `noexec`, and the task
+  still runs as `65534:65534` with no network, a read-only root filesystem and
+  all capabilities dropped. Only files the task wrote into its own workspace
+  become executable.
+
 ## Docker acceptance
 
 With Docker running and the pinned task image already present, run the opt-in
