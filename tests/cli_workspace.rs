@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,7 +63,6 @@ fn run_with_workspace(directory: &Path, options: &[&str]) -> std::process::Outpu
     wardnm(directory, &args)
 }
 
-#[cfg(unix)]
 #[test]
 fn sizes_an_executable_workspace_from_the_command_line() {
     let (directory, log) = fake_docker("exec");
