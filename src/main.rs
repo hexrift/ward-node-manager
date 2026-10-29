@@ -30,6 +30,7 @@ fn run() -> Result<i32, String> {
 
     let mut run_id = format!("run-{}-{}", std::process::id(), timestamp_nanos());
     let mut task_id = None;
+    let mut image = PINNED_IMAGE.to_owned();
     let mut workspace_snapshot = None;
     let mut workspace_snapshot_output = None;
     let mut limits = Limits {
@@ -49,6 +50,7 @@ fn run() -> Result<i32, String> {
         match arg.as_str() {
             "--run-id" => run_id = value,
             "--task-id" => task_id = Some(value),
+            "--image" => image = value,
             "--snapshot" => workspace_snapshot = Some(read_snapshot(&value)?),
             "--snapshot-output" => workspace_snapshot_output = Some(value),
             "--wall-seconds" => limits.wall_seconds = parse(&value)?,
@@ -68,7 +70,7 @@ fn run() -> Result<i32, String> {
         workspace_snapshot,
     };
     let config = ManagerConfig {
-        image: PINNED_IMAGE.into(),
+        image,
         run_id,
         limits,
     };
