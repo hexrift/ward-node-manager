@@ -663,6 +663,7 @@ mod tests {
     use super::container_timed_out;
     use super::decode_workspace_result_frame;
     use super::docker_environment;
+    #[cfg(unix)]
     use super::DEFAULT_WORKSPACE_BYTES;
     #[cfg(unix)]
     use super::{Limits, ManagerConfig, NodeManager, RunError, TaskSpec, PINNED_IMAGE};
